@@ -11,6 +11,7 @@
     <style>
         .show-on-export { display: none; }
         .well-button { touch-action: none; }
+        .exporting .hide-on-export { display: none; }
         .exporting .well-button[data-active="true"] {
             transform: none;
             border-color: #f1f5f9;
@@ -59,6 +60,12 @@
             </svg>
         );
 
+        const Shuffle = ({ size = 24, className = "" }) => (
+            <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+                <path d="M2 18h1.4c1.3 0 2.5-.6 3.3-1.7l6.1-8.6c.7-1.1 2-1.7 3.3-1.7H22"/><path d="m18 2 4 4-4 4"/><path d="M2 6h1.9c1.5 0 2.9.9 3.6 2.2"/><path d="M22 18h-5.9c-1.3 0-2.6-.7-3.3-1.8l-.5-.8"/><path d="m18 14 4 4-4 4"/>
+            </svg>
+        );
+
         const PLATE_CONFIGS = {
             6: { rows: 2, cols: 3 },
             12: { rows: 3, cols: 4 },
@@ -80,7 +87,10 @@
             { name: 'Indigo', value: '#6366f1' },
         ];
 
-        const STORAGE_KEY = 'wellsim:v1';
+        const STORAGE_KEY = 'wellsim:v2';
+        const LEGACY_STORAGE_KEY = 'wellsim:v1';
+        const BLANK = '#ffffff';
+        const GROUP_COLORS = WELL_COLORS.filter((c) => c.value !== BLANK).map((c) => c.value);
 
         const parseWellId = (id) => {
             const match = /^([A-Z])(\d{1,2})$/.exec(id);
@@ -99,32 +109,336 @@
                 .map(Number)
                 .find((size) => ids.every((id) => fitsPlate(id, size)));
 
-        const isUsedWell = (well) => well.color !== '#ffffff' || well.label !== '';
+        const isUsedWell = (well) => well.color !== BLANK || well.label !== '';
+
+        const wellIdsFor = (size) => {
+            const { rows, cols } = PLATE_CONFIGS[size];
+            return Array.from({ length: rows * cols }, (_, i) =>
+                `${String.fromCharCode(65 + Math.floor(i / cols))}${(i % cols) + 1}`);
+        };
+
+        const isEdgeWell = (id, size) => {
+            const { row, col } = parseWellId(id);
+            const { rows, cols } = PLATE_CONFIGS[size];
+            return row === 1 || row === rows || col === 1 || col === cols;
+        };
+
+        // mulberry32: small seeded PRNG so a layout can be reproduced from its seed
+        const createRng = (seed) => {
+            let a = seed >>> 0;
+            return () => {
+                a = (a + 0x6D2B79F5) >>> 0;
+                let t = a;
+                t = Math.imul(t ^ (t >>> 15), t | 1);
+                t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+                return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+            };
+        };
+
+        const shuffle = (items, rng) => {
+            const result = [...items];
+            for (let i = result.length - 1; i > 0; i--) {
+                const j = Math.floor(rng() * (i + 1));
+                [result[i], result[j]] = [result[j], result[i]];
+            }
+            return result;
+        };
+
+        const randomSeed = () => Math.floor(Math.random() * 1000000);
+
+        const parseList = (text, separator) => text.split(separator).map((s) => s.trim()).filter(Boolean);
+
+        const planDesign = ({ groups, replicates, plateSize, excludeEdges }) => {
+            const slots = wellIdsFor(plateSize).filter((id) => !(excludeEdges && isEdgeWell(id, plateSize)));
+            const wellsPerSet = groups.length * replicates;
+            const platesPerSet = slots.length > 0 ? Math.ceil(wellsPerSet / slots.length) : 0;
+            return { slots, wellsPerSet, platesPerSet };
+        };
+
+        // Spread each group's replicates over as many plates as possible, keeping plate fill balanced
+        const assignToPlates = (groupCount, replicates, plateCount, rng) => {
+            const capacity = Math.ceil((groupCount * replicates) / plateCount);
+            const plates = Array.from({ length: plateCount }, () => []);
+            const score = (p, g) => plates[p].filter((x) => x === g).length * 1000 + plates[p].length;
+            for (let r = 0; r < replicates; r++) {
+                shuffle([...Array(groupCount).keys()], rng).forEach((g) => {
+                    const candidates = shuffle([...Array(plateCount).keys()], rng)
+                        .filter((p) => plates[p].length < capacity);
+                    const best = candidates.reduce((a, b) => (score(b, g) < score(a, g) ? b : a));
+                    plates[best].push(g);
+                });
+            }
+            return plates;
+        };
+
+        const generateDesign = ({ groups, replicates, timepoints, plateSize, excludeEdges, seed }) => {
+            const rng = createRng(seed);
+            const { slots, platesPerSet } = planDesign({ groups, replicates, plateSize, excludeEdges });
+            const setNames = timepoints.length > 0 ? timepoints : [''];
+            return setNames.flatMap((setName) =>
+                assignToPlates(groups.length, replicates, platesPerSet, rng).map((groupIndexes, i) => {
+                    const positions = shuffle(slots, rng);
+                    const wells = {};
+                    groupIndexes.forEach((g, k) => {
+                        wells[positions[k]] = { color: GROUP_COLORS[g % GROUP_COLORS.length], label: groups[g] };
+                    });
+                    return { name: setName ? `${setName}-${i + 1}` : `Plate ${i + 1}`, wells };
+                })
+            );
+        };
+
+        const buildLegend = (plates) => {
+            const entries = new Map();
+            plates.forEach((plate) => Object.values(plate.wells).forEach((well) => {
+                if (!isUsedWell(well)) return;
+                const key = `${well.color}|${well.label}`;
+                const entry = entries.get(key) || { color: well.color, label: well.label, count: 0 };
+                entries.set(key, { ...entry, count: entry.count + 1 });
+            }));
+            const colorOrder = (color) => WELL_COLORS.findIndex((c) => c.value === color);
+            return [...entries.values()].sort((a, b) => colorOrder(a.color) - colorOrder(b.color));
+        };
+
+        const csvField = (value) => `"${String(value).replace(/"/g, '""')}"`;
+        const unquote = (value = '') => value.trim().replace(/^"|"$/g, '').replace(/""/g, '"');
+        const splitCsvLine = (line) => line.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map(unquote);
+
+        const emptyPlate = (index) => ({ name: `Plate ${index + 1}`, wells: {} });
+
+        const DEFAULT_DESIGN = {
+            groupsText: 'Control\nTreatment A\nTreatment B\nTreatment C',
+            replicates: 3,
+            timepointsText: '',
+            excludeEdges: false,
+            seed: randomSeed(),
+        };
 
         const loadSavedState = () => {
+            const fallback = { plateSize: 24, plates: [emptyPlate(0)], design: DEFAULT_DESIGN, designNote: '' };
             try {
                 const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-                if (saved && PLATE_CONFIGS[saved.plateSize] && saved.wells) return saved;
+                if (saved && PLATE_CONFIGS[saved.plateSize] && Array.isArray(saved.plates) && saved.plates.length > 0) {
+                    return { ...fallback, ...saved, design: { ...DEFAULT_DESIGN, ...saved.design } };
+                }
+                const legacy = JSON.parse(localStorage.getItem(LEGACY_STORAGE_KEY));
+                if (legacy && PLATE_CONFIGS[legacy.plateSize] && legacy.wells) {
+                    return { ...fallback, plateSize: legacy.plateSize, plates: [{ ...emptyPlate(0), wells: legacy.wells }] };
+                }
             } catch (e) {}
-            return { plateSize: 24, wells: {} };
+            return fallback;
         };
+
+        const sectionLabel = 'text-[11px] font-black text-slate-400 uppercase mb-3 block tracking-widest';
+        const textInput = 'w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 shadow-sm';
+
+        const DesignPanel = ({ design, onChange, plateSize, onGenerate }) => {
+            const groups = parseList(design.groupsText, /\r?\n/);
+            const timepoints = parseList(design.timepointsText, ',');
+            const { slots, wellsPerSet, platesPerSet } = planDesign({ groups, replicates: design.replicates, plateSize, excludeEdges: design.excludeEdges });
+            const setCount = Math.max(timepoints.length, 1);
+            const canGenerate = groups.length > 0 && design.replicates > 0 && slots.length > 0;
+            const update = (patch) => onChange({ ...design, ...patch });
+
+            return (
+                <div className="pt-6 border-t border-slate-100 space-y-3">
+                    <label className={`${sectionLabel} flex items-center gap-2`}>
+                        <Shuffle size={14} className="text-indigo-500" />
+                        Randomized Design
+                    </label>
+                    <div>
+                        <span className="text-xs font-bold text-slate-500">Groups（1行に1群）</span>
+                        <textarea
+                            value={design.groupsText}
+                            onChange={(e) => update({ groupsText: e.target.value })}
+                            rows={4}
+                            className={`${textInput} mt-1 resize-y`}
+                        />
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                        <label className="text-xs font-bold text-slate-500">
+                            N / group
+                            <input
+                                type="number"
+                                min={1}
+                                value={design.replicates}
+                                onChange={(e) => update({ replicates: Math.max(1, Number(e.target.value) || 1) })}
+                                className={`${textInput} mt-1`}
+                            />
+                        </label>
+                        <label className="text-xs font-bold text-slate-500">
+                            Seed
+                            <div className="flex gap-1 mt-1">
+                                <input
+                                    type="number"
+                                    value={design.seed}
+                                    onChange={(e) => update({ seed: Number(e.target.value) || 0 })}
+                                    className={`${textInput} px-2`}
+                                />
+                                <button
+                                    onClick={() => update({ seed: randomSeed() })}
+                                    className="px-2 rounded-xl border border-slate-200 bg-white hover:border-indigo-400 text-slate-500"
+                                    title="New seed"
+                                >
+                                    <Shuffle size={14} />
+                                </button>
+                            </div>
+                        </label>
+                    </div>
+                    <label className="text-xs font-bold text-slate-500 block">
+                        Timepoints（カンマ区切り・空欄可）
+                        <input
+                            type="text"
+                            value={design.timepointsText}
+                            onChange={(e) => update({ timepointsText: e.target.value })}
+                            placeholder="Day0, Day3, Day5"
+                            className={`${textInput} mt-1`}
+                        />
+                    </label>
+                    <label className="flex items-center gap-2 text-xs font-bold text-slate-500">
+                        <input
+                            type="checkbox"
+                            checked={design.excludeEdges}
+                            onChange={(e) => update({ excludeEdges: e.target.checked })}
+                        />
+                        Exclude edge wells
+                    </label>
+                    <p className="text-xs text-slate-500 bg-slate-50 rounded-xl p-3 border border-slate-200">
+                        {slots.length === 0
+                            ? 'このフォーマットでは使用できるウェルがありません。'
+                            : `${groups.length}群 × N=${design.replicates}${timepoints.length > 0 ? ` × ${setCount}時点` : ''} = ${wellsPerSet * setCount} wells → ${plateSize}-well × ${platesPerSet * setCount}枚`}
+                    </p>
+                    <button
+                        onClick={() => onGenerate({ groups, replicates: design.replicates, timepoints, excludeEdges: design.excludeEdges, seed: design.seed })}
+                        disabled={!canGenerate}
+                        className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 rounded-2xl transition-all disabled:opacity-40"
+                    >
+                        <Shuffle size={16} />
+                        Generate Layout
+                    </button>
+                </div>
+            );
+        };
+
+        const PlateGrid = ({ plate, plateIndex, plateSize, activeId, canRemove, onWellPointerDown, onWellPointerEnter, onRename, onRemove }) => {
+            const config = PLATE_CONFIGS[plateSize];
+            const rowLabels = Array.from({ length: config.rows }, (_, i) => String.fromCharCode(65 + i));
+            const colLabels = Array.from({ length: config.cols }, (_, i) => i + 1);
+            const wellClass = plateSize > 48 ? 'w-10 h-10' : plateSize > 24 ? 'w-12 h-12' : 'w-16 h-16';
+            const labelClass = plateSize > 48 ? 'w-10 text-[7px]' : plateSize > 24 ? 'w-12 text-[9px]' : 'w-16 text-[9px]';
+
+            return (
+                <div className="inline-block border border-slate-200 rounded-3xl p-6 pb-8">
+                    <div className="flex items-center justify-between mb-4 gap-4">
+                        <input
+                            type="text"
+                            value={plate.name}
+                            onChange={(e) => onRename(plateIndex, e.target.value)}
+                            className="text-lg font-black text-slate-700 bg-transparent focus:outline-none focus:bg-slate-50 rounded-lg px-1 w-48"
+                        />
+                        {canRemove && (
+                            <button
+                                onClick={() => onRemove(plateIndex)}
+                                className="hide-on-export text-xs font-bold text-slate-300 hover:text-rose-500"
+                            >
+                                Remove
+                            </button>
+                        )}
+                    </div>
+
+                    {/* Column Labels */}
+                    <div className="flex mb-4 ml-12">
+                        {colLabels.map((col) => (
+                            <div
+                                key={col}
+                                className="text-center font-black text-slate-300 text-sm tracking-tighter"
+                                style={{ width: plateSize > 48 ? '48px' : plateSize > 24 ? '56px' : '72px' }}
+                            >
+                                {col}
+                            </div>
+                        ))}
+                    </div>
+
+                    {/* Grid */}
+                    {rowLabels.map((row) => (
+                        <div key={row} className="flex items-center mb-6 last:mb-0">
+                            <div className="w-12 font-black text-slate-300 text-xl">{row}</div>
+
+                            <div className="flex gap-2">
+                                {colLabels.map((col) => {
+                                    const id = `${row}${col}`;
+                                    const wellData = plate.wells[id] || { color: BLANK, label: '' };
+                                    const isActive = activeId === id;
+
+                                    return (
+                                        <div key={id} className="relative flex flex-col items-center">
+                                            <button
+                                                onPointerDown={(e) => onWellPointerDown(e, plateIndex, id)}
+                                                onPointerEnter={() => onWellPointerEnter(plateIndex, id)}
+                                                data-active={isActive}
+                                                className={`
+                                                    well-button ${wellClass} rounded-full border-2 transition-all duration-150
+                                                    flex flex-col items-center justify-center relative shadow-sm cursor-crosshair
+                                                    ${isActive ? 'ring-4 ring-indigo-100 border-indigo-600 scale-110 z-20' : 'border-slate-100 hover:border-slate-300'}
+                                                `}
+                                                style={{ backgroundColor: wellData.color }}
+                                            >
+                                                <span className={`
+                                                    ${plateSize > 48 ? 'text-[8px]' : 'text-[10px]'} font-bold select-none
+                                                    ${wellData.color === BLANK ? 'text-slate-200' : 'text-white drop-shadow-md'}
+                                                `}>
+                                                    {id}
+                                                </span>
+                                            </button>
+                                            {/* Visual Label */}
+                                            {wellData.label && (
+                                                <div className={`
+                                                    absolute top-[105%] text-center leading-normal pb-0.5 font-bold text-slate-500 truncate
+                                                    ${labelClass}
+                                                `}>
+                                                    {wellData.label}
+                                                </div>
+                                            )}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            );
+        };
+
+        const Legend = ({ entries }) => (
+            <div className="flex flex-wrap justify-center gap-x-5 gap-y-2">
+                {entries.map((entry) => (
+                    <div key={`${entry.color}|${entry.label}`} className="flex items-center gap-2 text-sm font-bold text-slate-600">
+                        <span className="w-4 h-4 rounded-full border border-slate-200" style={{ backgroundColor: entry.color }}></span>
+                        {entry.label || WELL_COLORS.find((c) => c.value === entry.color)?.name || entry.color}
+                        <span className="text-slate-400 font-medium">×{entry.count}</span>
+                    </div>
+                ))}
+            </div>
+        );
 
         const App = () => {
             const [initialState] = useState(loadSavedState);
             const [plateSize, setPlateSize] = useState(initialState.plateSize);
+            const [plates, setPlates] = useState(initialState.plates);
+            const [design, setDesign] = useState(initialState.design);
+            const [designNote, setDesignNote] = useState(initialState.designNote);
             const [selectedColor, setSelectedColor] = useState(WELL_COLORS[1].value);
-            const [wells, setWells] = useState(initialState.wells);
-            const [activeWellId, setActiveWellId] = useState(null);
+            const [activeWell, setActiveWell] = useState(null);
             const [isExporting, setIsExporting] = useState(false);
             const [isDragging, setIsDragging] = useState(false);
             const [groupLabelInput, setGroupLabelInput] = useState('');
-            
+
             const plateRef = useRef(null);
             const fileInputRef = useRef(null);
 
-            const config = PLATE_CONFIGS[plateSize];
-            const rowLabels = Array.from({ length: config.rows }, (_, i) => String.fromCharCode(65 + i));
-            const colLabels = Array.from({ length: config.cols }, (_, i) => i + 1);
+            const activeData = activeWell ? plates[activeWell.plate]?.wells[activeWell.id] : null;
+            const legend = buildLegend(plates);
+            const occupancy = plates.reduce((sum, plate) =>
+                sum + Object.values(plate.wells).filter((w) => w.color !== BLANK).length, 0);
 
             useEffect(() => {
                 const handleGlobalPointerUp = () => setIsDragging(false);
@@ -138,89 +452,119 @@
 
             useEffect(() => {
                 try {
-                    localStorage.setItem(STORAGE_KEY, JSON.stringify({ plateSize, wells }));
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify({ plateSize, plates, design, designNote }));
                 } catch (e) {}
-            }, [plateSize, wells]);
+            }, [plateSize, plates, design, designNote]);
+
+            const hasData = () => plates.some((plate) => Object.values(plate.wells).some(isUsedWell));
+
+            const updatePlateWells = (plateIndex, updater) => {
+                setPlates((prev) => prev.map((plate, i) => (i === plateIndex ? { ...plate, wells: updater(plate.wells) } : plate)));
+            };
 
             const changePlateSize = (size) => {
                 if (size === plateSize) return;
-                const lost = Object.keys(wells).filter((id) => isUsedWell(wells[id]) && !fitsPlate(id, size));
+                const lost = plates.flatMap((plate) =>
+                    Object.keys(plate.wells)
+                        .filter((id) => isUsedWell(plate.wells[id]) && !fitsPlate(id, size))
+                        .map((id) => `${plate.name}:${id}`));
                 if (lost.length > 0 && !confirm(`${size}ウェルに収まらない ${lost.length} 個のウェル（${lost.slice(0, 5).join(', ')}${lost.length > 5 ? ' ...' : ''}）のデータが削除されます。続けますか？`)) {
                     return;
                 }
-                setWells((prev) => Object.fromEntries(Object.entries(prev).filter(([id]) => fitsPlate(id, size))));
-                if (activeWellId && !fitsPlate(activeWellId, size)) setActiveWellId(null);
+                setPlates((prev) => prev.map((plate) => ({
+                    ...plate,
+                    wells: Object.fromEntries(Object.entries(plate.wells).filter(([id]) => fitsPlate(id, size)))
+                })));
+                if (activeWell && !fitsPlate(activeWell.id, size)) setActiveWell(null);
                 setPlateSize(size);
             };
 
-            const updateWellColor = (id, color) => {
-                setWells((prev) => ({
-                    ...prev,
-                    [id]: {
-                        ...prev[id],
-                        color: color,
-                        label: prev[id]?.label || ''
-                    }
+            const updateWellColor = (plateIndex, id, color) => {
+                updatePlateWells(plateIndex, (wells) => ({
+                    ...wells,
+                    [id]: { ...wells[id], color, label: wells[id]?.label || '' }
                 }));
             };
 
-            const handleWellPointerDown = (e, id) => {
+            const handleWellPointerDown = (e, plateIndex, id) => {
                 // Release implicit touch capture so pointerenter fires on neighbouring wells
                 if (e.currentTarget.hasPointerCapture(e.pointerId)) {
                     e.currentTarget.releasePointerCapture(e.pointerId);
                 }
                 setIsDragging(true);
-                setActiveWellId(id);
-                const newColor = wells[id]?.color === selectedColor && selectedColor !== '#ffffff' ? '#ffffff' : selectedColor;
-                updateWellColor(id, newColor);
+                setActiveWell({ plate: plateIndex, id });
+                const current = plates[plateIndex].wells[id]?.color;
+                const newColor = current === selectedColor && selectedColor !== BLANK ? BLANK : selectedColor;
+                updateWellColor(plateIndex, id, newColor);
             };
 
-            const handleWellPointerEnter = (id) => {
+            const handleWellPointerEnter = (plateIndex, id) => {
                 if (isDragging) {
-                    updateWellColor(id, selectedColor);
+                    updateWellColor(plateIndex, id, selectedColor);
                 }
             };
 
             const handleLabelChange = (e) => {
-                if (!activeWellId) return;
+                if (!activeWell) return;
                 const value = e.target.value;
-                setWells((prev) => ({
-                    ...prev,
-                    [activeWellId]: {
-                        ...prev[activeWellId],
-                        label: value
-                    }
+                updatePlateWells(activeWell.plate, (wells) => ({
+                    ...wells,
+                    [activeWell.id]: { color: BLANK, ...wells[activeWell.id], label: value }
                 }));
             };
 
             const applyGroupLabel = () => {
-                if (selectedColor === '#ffffff') {
+                if (selectedColor === BLANK) {
                     return;
                 }
-                setWells((prev) => Object.fromEntries(
-                    Object.entries(prev).map(([id, well]) => [
+                setPlates((prev) => prev.map((plate) => ({
+                    ...plate,
+                    wells: Object.fromEntries(Object.entries(plate.wells).map(([id, well]) => [
                         id,
                         well.color === selectedColor ? { ...well, label: groupLabelInput } : well
-                    ])
-                ));
+                    ]))
+                })));
                 setGroupLabelInput('');
             };
 
-            const resetPlate = () => {
-                if (confirm('プレートをリセットしてもよろしいですか？すべてのデータが消去されます。')) {
-                    setWells({});
-                    setActiveWellId(null);
+            const renamePlate = (plateIndex, name) => {
+                setPlates((prev) => prev.map((plate, i) => (i === plateIndex ? { ...plate, name } : plate)));
+            };
+
+            const addPlate = () => setPlates((prev) => [...prev, emptyPlate(prev.length)]);
+
+            const removePlate = (plateIndex) => {
+                if (Object.values(plates[plateIndex].wells).some(isUsedWell) && !confirm(`${plates[plateIndex].name} を削除しますか？`)) {
+                    return;
+                }
+                setPlates((prev) => prev.filter((_, i) => i !== plateIndex));
+                setActiveWell(null);
+            };
+
+            const resetPlates = () => {
+                if (confirm('すべてのプレートをリセットしてもよろしいですか？すべてのデータが消去されます。')) {
+                    setPlates([emptyPlate(0)]);
+                    setDesignNote('');
+                    setActiveWell(null);
                 }
             };
 
+            const handleGenerate = (params) => {
+                if (hasData() && !confirm('現在のプレートを上書きして、ランダム配置を生成しますか？')) {
+                    return;
+                }
+                setPlates(generateDesign({ ...params, plateSize }));
+                setDesignNote(`${params.groups.length} groups × N=${params.replicates}${params.excludeEdges ? ' · edge wells excluded' : ''} · seed ${params.seed}`);
+                setActiveWell(null);
+            };
+
             const exportToCSV = () => {
-                const headers = ["Well_ID", "Color_HEX", "Label"];
-                const csvContent = [
-                    headers.join(","),
-                    ...Object.entries(wells)
-                        .filter(([_, data]) => data.color !== '#ffffff' || data.label !== '')
-                        .map(([id, data]) => `${id},${data.color},"${(data.label || "").replace(/"/g, '""')}"`)
-                ].join("\n");
+                const headers = ['Plate', 'Well_ID', 'Color_HEX', 'Label'];
+                const rows = plates.flatMap((plate) =>
+                    wellIdsFor(plateSize)
+                        .filter((id) => plate.wells[id] && isUsedWell(plate.wells[id]))
+                        .map((id) => [csvField(plate.name), id, plate.wells[id].color, csvField(plate.wells[id].label || '')].join(',')));
+                const csvContent = [headers.join(','), ...rows].join('\n');
 
                 const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
                 const link = document.createElement('a');
@@ -235,28 +579,31 @@
 
                 const reader = new FileReader();
                 reader.onload = (e) => {
-                    const text = e.target.result;
-                    const lines = text.split(/\r?\n/);
-                    const newWells = {};
-                    
+                    const lines = e.target.result.split(/\r?\n/);
+                    const hasPlateColumn = splitCsvLine(lines[0] || '')[0].toLowerCase() === 'plate';
+                    const byName = new Map();
+
                     for (let i = 1; i < lines.length; i++) {
                         if (!lines[i].trim()) continue;
-                        const [rawId, color, label] = lines[i].split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
-                        const id = (rawId || '').trim().toUpperCase();
-                        if (fitsPlate(id, 96)) {
-                            newWells[id] = {
-                                color: color?.trim() || '#ffffff',
-                                label: label ? label.replace(/^"|"$/g, '').replace(/""/g, '"') : ''
-                            };
-                        }
+                        const fields = splitCsvLine(lines[i]);
+                        const [plateName, rawId, color, label] = hasPlateColumn ? fields : ['Plate 1', ...fields];
+                        const id = (rawId || '').toUpperCase();
+                        if (!fitsPlate(id, 96)) continue;
+                        const name = plateName || 'Plate 1';
+                        if (!byName.has(name)) byName.set(name, {});
+                        byName.get(name)[id] = { color: color || BLANK, label: label || '' };
                     }
-                    const size = smallestPlateFor(Object.keys(newWells));
+
+                    const newPlates = [...byName.entries()].map(([name, wells]) => ({ name, wells }));
+                    if (newPlates.length === 0) return;
+                    const size = smallestPlateFor(newPlates.flatMap((plate) => Object.keys(plate.wells)));
                     if (size > plateSize) setPlateSize(size);
-                    setActiveWellId(null);
-                    setWells(newWells);
+                    setActiveWell(null);
+                    setDesignNote('');
+                    setPlates(newPlates);
                 };
                 reader.readAsText(file);
-                event.target.value = null; 
+                event.target.value = null;
             };
 
             const downloadAsImage = async () => {
@@ -281,7 +628,7 @@
                         },
                     });
                     const link = document.createElement('a');
-                    link.download = `plate_image_${plateSize}well.png`;
+                    link.download = `plate_image_${plateSize}well_${plates.length}plates.png`;
                     link.href = canvas.toDataURL('image/png');
                     link.click();
                 } catch (err) {
@@ -294,7 +641,7 @@
             return (
                 <div className="min-h-screen bg-[#f8fafc] text-[#1e293b] p-4 md:p-8 font-sans select-none">
                     <div className="max-w-[1600px] mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8">
-                        
+
                         {/* Sidebar */}
                         <aside className="lg:col-span-3 space-y-6">
                             <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-200">
@@ -304,19 +651,19 @@
                                     </div>
                                     <h1 className="text-xl font-bold tracking-tight">Plate Designer</h1>
                                 </div>
-                                
+
                                 <div className="space-y-6">
                                     {/* Format Selection */}
                                     <div>
-                                        <label className="text-[11px] font-black text-slate-400 uppercase mb-3 block tracking-widest">Plate Format</label>
+                                        <label className={sectionLabel}>Plate Format</label>
                                         <div className="grid grid-cols-3 gap-2">
                                             {[6, 12, 24, 48, 96].map((size) => (
                                                 <button
                                                     key={size}
                                                     onClick={() => changePlateSize(size)}
                                                     className={`py-2.5 rounded-xl text-sm font-bold transition-all ${
-                                                        plateSize === size 
-                                                            ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-200 scale-105' 
+                                                        plateSize === size
+                                                            ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-200 scale-105'
                                                             : 'bg-slate-50 text-slate-500 hover:bg-slate-100'
                                                     }`}
                                                 >
@@ -326,9 +673,16 @@
                                         </div>
                                     </div>
 
+                                    <DesignPanel
+                                        design={design}
+                                        onChange={setDesign}
+                                        plateSize={plateSize}
+                                        onGenerate={handleGenerate}
+                                    />
+
                                     {/* Palette */}
                                     <div className="pt-6 border-t border-slate-100">
-                                        <label className="text-[11px] font-black text-slate-400 uppercase mb-3 block tracking-widest">Active Color</label>
+                                        <label className={sectionLabel}>Active Color</label>
                                         <div className="grid grid-cols-5 gap-3">
                                             {WELL_COLORS.map((color) => (
                                                 <button
@@ -346,7 +700,7 @@
 
                                     {/* Group Label */}
                                     <div className="pt-6 border-t border-slate-100">
-                                        <label className="text-[11px] font-black text-slate-400 uppercase mb-3 block tracking-widest flex items-center gap-2">
+                                        <label className={`${sectionLabel} flex items-center gap-2`}>
                                             <Layers size={14} className="text-indigo-500" />
                                             Group Label
                                         </label>
@@ -356,8 +710,7 @@
                                                 value={groupLabelInput}
                                                 onChange={(e) => setGroupLabelInput(e.target.value)}
                                                 placeholder="Enter label for color..."
-                                                className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 shadow-sm"
-                                                onMouseDown={(e) => e.stopPropagation()}
+                                                className={textInput}
                                             />
                                             <button
                                                 onClick={applyGroupLabel}
@@ -370,21 +723,22 @@
 
                                     {/* Individual Metadata Editor */}
                                     <div className="pt-6 border-t border-slate-100">
-                                        <label className="text-[11px] font-black text-slate-400 uppercase mb-3 block tracking-widest">Well Attributes</label>
+                                        <label className={sectionLabel}>Well Attributes</label>
                                         <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200">
-                                            {activeWellId ? (
+                                            {activeWell ? (
                                                 <div className="space-y-3">
                                                     <div className="flex items-center justify-between">
-                                                        <span className="text-sm font-black text-indigo-600">ID: {activeWellId}</span>
-                                                        <div className="w-3 h-3 rounded-full" style={{ backgroundColor: wells[activeWellId]?.color || '#fff' }}></div>
+                                                        <span className="text-sm font-black text-indigo-600">
+                                                            {plates[activeWell.plate]?.name} · {activeWell.id}
+                                                        </span>
+                                                        <div className="w-3 h-3 rounded-full" style={{ backgroundColor: activeData?.color || BLANK }}></div>
                                                     </div>
                                                     <input
                                                         type="text"
-                                                        value={wells[activeWellId]?.label || ''}
+                                                        value={activeData?.label || ''}
                                                         onChange={handleLabelChange}
                                                         placeholder="Enter Label..."
-                                                        className="w-full bg-white border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 shadow-sm"
-                                                        onMouseDown={(e) => e.stopPropagation()}
+                                                        className={`${textInput} bg-white`}
                                                     />
                                                 </div>
                                             ) : (
@@ -404,7 +758,7 @@
                                         <ImageIcon size={18} />
                                         {isExporting ? 'Generating...' : 'Export Image'}
                                     </button>
-                                    
+
                                     <div className="grid grid-cols-2 gap-2">
                                         <button
                                             onClick={exportToCSV}
@@ -420,21 +774,21 @@
                                             <Upload size={16} />
                                             CSV In
                                         </button>
-                                        <input 
-                                            type="file" 
-                                            ref={fileInputRef} 
-                                            onChange={importFromCSV} 
-                                            accept=".csv" 
-                                            className="hidden" 
+                                        <input
+                                            type="file"
+                                            ref={fileInputRef}
+                                            onChange={importFromCSV}
+                                            accept=".csv"
+                                            className="hidden"
                                         />
                                     </div>
 
                                     <button
-                                        onClick={resetPlate}
+                                        onClick={resetPlates}
                                         className="w-full flex items-center justify-center gap-2 text-rose-500 hover:bg-rose-50 font-bold py-2 rounded-xl transition-all mt-2"
                                     >
                                         <RotateCcw size={16} />
-                                        Clear Plate
+                                        Clear All Plates
                                     </button>
                                 </div>
                             </div>
@@ -442,93 +796,62 @@
 
                         {/* Main Viewport */}
                         <main className="lg:col-span-9">
-                            <div className="bg-white p-6 md:p-12 rounded-[3rem] shadow-sm border border-slate-200 min-h-[700px] flex flex-col items-center justify-center relative overflow-hidden">
-                                
+                            <div className="bg-white p-6 md:p-12 rounded-[3rem] shadow-sm border border-slate-200 min-h-[700px] relative overflow-hidden">
+
                                 <div className="absolute top-0 left-0 w-full h-2 bg-indigo-600"></div>
 
                                 <div ref={plateRef} className="bg-white p-8">
                                     {/* Header for PNG Export only */}
                                     <div className="show-on-export mb-8 text-center">
                                         <h2 className="text-2xl font-black text-slate-900">{plateSize}-Well Experimental Layout</h2>
-                                        <p className="text-slate-400 font-medium">Generated via Professional Plate Designer • {new Date().toDateString()}</p>
+                                        <p className="text-slate-400 font-medium">
+                                            {plates.length} plate{plates.length > 1 ? 's' : ''}{designNote ? ` · ${designNote}` : ''} • {new Date().toDateString()}
+                                        </p>
                                     </div>
 
-                                    <div className="inline-block">
-                                        {/* Column Labels */}
-                                        <div className="flex mb-4 ml-12">
-                                            {colLabels.map((col) => (
-                                                <div 
-                                                    key={col} 
-                                                    className="text-center font-black text-slate-300 text-sm tracking-tighter"
-                                                    style={{ width: plateSize > 48 ? '44px' : plateSize > 24 ? '56px' : '72px' }}
-                                                >
-                                                    {col}
-                                                </div>
-                                            ))}
+                                    {legend.length > 0 && (
+                                        <div className="mb-8">
+                                            <Legend entries={legend} />
                                         </div>
+                                    )}
 
-                                        {/* Grid */}
-                                        {rowLabels.map((row) => (
-                                            <div key={row} className="flex items-center mb-4 last:mb-0">
-                                                <div className="w-12 font-black text-slate-300 text-xl">{row}</div>
-                                                
-                                                <div className="flex gap-2">
-                                                    {colLabels.map((col) => {
-                                                        const id = `${row}${col}`;
-                                                        const wellData = wells[id] || { color: '#ffffff', label: '' };
-                                                        const isActive = activeWellId === id;
-                                                        
-                                                        const wellClass = plateSize > 48 ? 'w-10 h-10' : plateSize > 24 ? 'w-12 h-12' : 'w-16 h-16';
-                                                        const labelClass = plateSize > 48 ? 'w-10 text-[7px]' : plateSize > 24 ? 'w-12 text-[9px]' : 'w-16 text-[9px]';
-
-                                                        return (
-                                                            <div key={id} className="relative flex flex-col items-center">
-                                                                <button
-                                                                    onPointerDown={(e) => handleWellPointerDown(e, id)}
-                                                                    onPointerEnter={() => handleWellPointerEnter(id)}
-                                                                    data-active={isActive}
-                                                                    className={`
-                                                                        well-button ${wellClass} rounded-full border-2 transition-all duration-150 
-                                                                        flex flex-col items-center justify-center relative shadow-sm cursor-crosshair
-                                                                        ${isActive ? 'ring-4 ring-indigo-100 border-indigo-600 scale-110 z-20' : 'border-slate-100 hover:border-slate-300'}
-                                                                    `}
-                                                                    style={{ backgroundColor: wellData.color }}
-                                                                >
-                                                                    <span className={`
-                                                                        ${plateSize > 48 ? 'text-[8px]' : 'text-[10px]'} font-bold select-none
-                                                                        ${wellData.color === '#ffffff' ? 'text-slate-200' : 'text-white drop-shadow-md'}
-                                                                    `}>
-                                                                        {id}
-                                                                    </span>
-                                                                </button>
-                                                                {/* Visual Label */}
-                                                                {wellData.label && (
-                                                                    <div className={`
-                                                                        absolute top-[105%] text-center leading-tight font-bold text-slate-500 truncate
-                                                                        ${labelClass}
-                                                                    `}>
-                                                                        {wellData.label}
-                                                                    </div>
-                                                                )}
-                                                            </div>
-                                                        );
-                                                    })}
-                                                </div>
-                                            </div>
+                                    <div className="flex flex-wrap justify-center gap-8">
+                                        {plates.map((plate, i) => (
+                                            <PlateGrid
+                                                key={i}
+                                                plate={plate}
+                                                plateIndex={i}
+                                                plateSize={plateSize}
+                                                activeId={activeWell?.plate === i ? activeWell.id : null}
+                                                canRemove={plates.length > 1}
+                                                onWellPointerDown={handleWellPointerDown}
+                                                onWellPointerEnter={handleWellPointerEnter}
+                                                onRename={renamePlate}
+                                                onRemove={removePlate}
+                                            />
                                         ))}
                                     </div>
                                 </div>
+
+                                <div className="flex justify-center">
+                                    <button
+                                        onClick={addPlate}
+                                        className="flex items-center gap-2 text-sm font-bold text-indigo-600 hover:bg-indigo-50 px-4 py-2 rounded-xl"
+                                    >
+                                        + Add Plate
+                                    </button>
+                                </div>
                             </div>
-                            
+
                             <div className="mt-8 flex justify-between items-center px-4">
                                 <div className="flex gap-6">
                                     <div className="flex flex-col">
                                         <span className="text-[10px] font-black text-slate-400 uppercase">Format</span>
-                                        <span className="text-sm font-bold">{plateSize} Standard Well</span>
+                                        <span className="text-sm font-bold">{plateSize} Standard Well × {plates.length}</span>
                                     </div>
                                     <div className="flex flex-col">
                                         <span className="text-[10px] font-black text-slate-400 uppercase">Occupancy</span>
-                                        <span className="text-sm font-bold text-indigo-600">{Object.keys(wells).filter(k => wells[k].color !== '#ffffff' && fitsPlate(k, plateSize)).length} Positions</span>
+                                        <span className="text-sm font-bold text-indigo-600">{occupancy} Positions</span>
                                     </div>
                                 </div>
                                 <div className="text-[11px] font-bold text-slate-300 flex items-center gap-2">
