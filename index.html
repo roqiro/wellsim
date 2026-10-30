@@ -92,10 +92,14 @@
         const BLANK = '#ffffff';
         const GROUP_COLORS = WELL_COLORS.filter((c) => c.value !== BLANK).map((c) => c.value);
 
+        // Cached: the balance search parses the same few hundred IDs millions of times
+        const parsedWellIds = new Map();
         const parseWellId = (id) => {
+            if (parsedWellIds.has(id)) return parsedWellIds.get(id);
             const match = /^([A-Z])(\d{1,2})$/.exec(id);
-            if (!match) return null;
-            return { row: match[1].charCodeAt(0) - 64, col: Number(match[2]) };
+            const parsed = match ? { row: match[1].charCodeAt(0) - 64, col: Number(match[2]) } : null;
+            parsedWellIds.set(id, parsed);
+            return parsed;
         };
 
         const fitsPlate = (id, size) => {
@@ -185,6 +189,8 @@
         const analyzeBalance = (plates, plateSize) => {
             const groups = new Map();
             const occupiedLines = plates.map(() => ({ rows: new Set(), cols: new Set() }));
+            const occupiedPositions = new Set();
+            const positionCounts = new Map();
             let used = 0;
             let usedEdge = 0;
             plates.forEach((plate, p) => {
@@ -192,7 +198,7 @@
                 Object.entries(plate.wells).forEach(([id, well]) => {
                     if (!isUsedWell(well) || !fitsPlate(id, plateSize)) return;
                     const key = groupKeyOf(well);
-                    const group = groups.get(key) || { key, color: well.color, count: 0, edge: 0, linePairs: 0, adjacentPairs: 0, perPlate: plates.map(() => 0) };
+                    const group = groups.get(key) || { key, color: well.color, count: 0, edge: 0, linePairs: 0, adjacentPairs: 0, positionRepeats: 0, perPlate: plates.map(() => 0) };
                     const { row, col } = parseWellId(id);
                     const edge = isEdgeWell(id, plateSize);
                     group.count++;
@@ -200,6 +206,11 @@
                     group.perPlate[p]++;
                     occupiedLines[p].rows.add(row);
                     occupiedLines[p].cols.add(col);
+                    occupiedPositions.add(id);
+                    const positionKey = `${key}|${id}`;
+                    const seenAtPosition = positionCounts.get(positionKey) || 0;
+                    group.positionRepeats += seenAtPosition;
+                    positionCounts.set(positionKey, seenAtPosition + 1);
                     [`r${row}`, `c${col}`].forEach((line) => {
                         const lineKey = `${key}|${line}`;
                         const seen = lineCounts.get(lineKey) || 0;
@@ -221,21 +232,27 @@
                 expectedEdge: group.count * edgeShare,
                 minLinePairs: group.perPlate.reduce((sum, k, p) =>
                     sum + minLinePairs(k, occupiedLines[p].rows.size) + minLinePairs(k, occupiedLines[p].cols.size), 0),
+                minPositionRepeats: minLinePairs(group.count, occupiedPositions.size),
                 platesUsed: group.perPlate.filter(Boolean).length,
                 maxPerPlate: Math.max(...group.perPlate),
             }));
-            const penalty = rows.reduce((sum, g) =>
+            const layoutPenalty = rows.reduce((sum, g) =>
                 sum + 2 * (g.edge - g.expectedEdge) ** 2 + (g.linePairs - g.minLinePairs) + 2 * g.adjacentPairs, 0);
-            return { rows, edgeShare, penalty };
+            const repeatPenalty = rows.reduce((sum, g) => sum + 2 * (g.positionRepeats - g.minPositionRepeats), 0);
+            return { rows, edgeShare, layoutPenalty, repeatPenalty, penalty: layoutPenalty + repeatPenalty };
         };
 
         const BALANCE_CANDIDATES = 100;
         const BALANCE_SWAP_STEPS = 3000;
 
-        // Hill-climb from the best random candidate by swapping two slots within a plate
-        const improveBySwaps = (layout, slots, plateSize, rng) => {
-            let bestPenalty = analyzeBalance(layout, plateSize).penalty;
-            for (let step = 0; step < BALANCE_SWAP_STEPS && bestPenalty > 0; step++) {
+        // Caps the final whole-design pass so large designs stay responsive
+        const POLISH_WELL_BUDGET = 200000;
+
+        // Hill-climb by swapping two slots within a plate; equal-penalty swaps are kept
+        // so the search can drift across plateaus instead of stalling
+        const improveBySwaps = (layout, slots, score, rng, steps) => {
+            let bestPenalty = score(layout);
+            for (let step = 0; step < steps && bestPenalty > 0; step++) {
                 const wells = layout[Math.floor(rng() * layout.length)].wells;
                 const a = slots[Math.floor(rng() * slots.length)];
                 const b = slots[Math.floor(rng() * slots.length)];
@@ -246,46 +263,90 @@
                     if (wa) wells[b] = wa; else delete wells[b];
                 };
                 swap();
-                const penalty = analyzeBalance(layout, plateSize).penalty;
-                if (penalty < bestPenalty) bestPenalty = penalty;
+                const penalty = score(layout);
+                if (penalty <= bestPenalty) bestPenalty = penalty;
                 else swap();
             }
             return layout;
         };
 
-        const generateDesign = ({ groups, replicates, timepoints, plateSize, excludeEdges, balancePositions, seed }) => {
+        const designSetNames = (experiments, timepoints) => {
+            const experimentNames = experiments > 1 ? Array.from({ length: experiments }, (_, e) => `Exp${e + 1}`) : [''];
+            const timepointNames = timepoints.length > 0 ? timepoints : [''];
+            return experimentNames.flatMap((exp) => timepointNames.map((tp) => [exp, tp].filter(Boolean).join('-')));
+        };
+
+        // Counts same-group/same-position pairs, optionally on top of earlier plates' counts
+        const tallyPositions = (plates, prior = new Map()) => {
+            const counts = new Map();
+            let pairs = 0;
+            plates.forEach((plate) => Object.entries(plate.wells).forEach(([id, well]) => {
+                if (!isUsedWell(well)) return;
+                const key = `${groupKeyOf(well)}|${id}`;
+                const seen = counts.get(key) || 0;
+                pairs += seen + (prior.get(key) || 0);
+                counts.set(key, seen + 1);
+            }));
+            return { counts, pairs };
+        };
+
+        // Sets are optimised one after another so that later plates avoid the positions
+        // each group already took on earlier plates (randomized Latin-square-like rotation),
+        // then a whole-design pass repairs dead ends left by the sequential greedy step
+        const generateDesign = ({ groups, replicates, experiments, timepoints, plateSize, excludeEdges, balancePositions, rotatePositions, seed }) => {
             const rng = createRng(seed);
             const { slots, platesPerSet } = planDesign({ groups, replicates, plateSize, excludeEdges });
-            const setNames = timepoints.length > 0 ? timepoints : [''];
-            return setNames.flatMap((setName) => {
+            const optimize = balancePositions || rotatePositions;
+            const plates = designSetNames(experiments, timepoints).reduce((done, setName) => {
+                const { counts: prior } = tallyPositions(done);
+                const setScore = (setPlates) =>
+                    (balancePositions ? analyzeBalance(setPlates, plateSize).layoutPenalty : 0) +
+                    (rotatePositions ? 2 * tallyPositions(setPlates, prior).pairs : 0);
                 const plateGroups = assignToPlates(groups.length, replicates, platesPerSet, rng);
+                const plateName = (i) => {
+                    if (!setName) return `Plate ${done.length + i + 1}`;
+                    return platesPerSet > 1 ? `${setName}-${i + 1}` : setName;
+                };
                 const buildLayout = () => plateGroups.map((groupIndexes, i) => {
                     const positions = shuffle(slots, rng);
                     const wells = {};
                     groupIndexes.forEach((g, k) => {
                         wells[positions[k]] = { color: GROUP_COLORS[g % GROUP_COLORS.length], label: groups[g] };
                     });
-                    return { name: setName ? `${setName}-${i + 1}` : `Plate ${i + 1}`, wells };
+                    return { name: plateName(i), wells };
                 });
                 let best = buildLayout();
-                if (!balancePositions) return best;
-                let bestPenalty = analyzeBalance(best, plateSize).penalty;
+                if (!optimize) return [...done, ...best];
+                let bestPenalty = setScore(best);
                 for (let k = 1; k < BALANCE_CANDIDATES; k++) {
                     const candidate = buildLayout();
-                    const penalty = analyzeBalance(candidate, plateSize).penalty;
+                    const penalty = setScore(candidate);
                     if (penalty < bestPenalty) {
                         best = candidate;
                         bestPenalty = penalty;
                     }
                 }
-                return improveBySwaps(best, slots, plateSize, rng);
-            });
+                return [...done, ...improveBySwaps(best, slots, setScore, rng, BALANCE_SWAP_STEPS)];
+            }, []);
+            if (!optimize || plates.length < 2) return plates;
+            const fullScore = (layout) => {
+                const { layoutPenalty, repeatPenalty } = analyzeBalance(layout, plateSize);
+                return (balancePositions ? layoutPenalty : 0) + (rotatePositions ? repeatPenalty : 0);
+            };
+            const totalWells = groups.length * replicates * plates.length / platesPerSet;
+            const polishSteps = Math.min(BALANCE_SWAP_STEPS, Math.round(POLISH_WELL_BUDGET / totalWells));
+            return improveBySwaps(plates, slots, fullScore, rng, polishSteps);
         };
 
-        // Seeding/measurement order: plates in random order, wells shuffled within each plate
+        const experimentOf = (plateName) => Number(/^Exp(\d+)/.exec(plateName)?.[1] ?? 0);
+
+        // Seeding/measurement order: experiments kept together, plates in random order
+        // within each experiment, wells shuffled within each plate
         const buildWorkOrder = (plates, plateSize, seed) => {
             const rng = createRng(seed ^ 0x5bd1e995);
-            return shuffle([...plates.keys()], rng).flatMap((p) =>
+            return shuffle([...plates.keys()], rng)
+                .sort((a, b) => experimentOf(plates[a].name) - experimentOf(plates[b].name))
+                .flatMap((p) =>
                 shuffle(wellIdsFor(plateSize).filter((id) => plates[p].wells[id] && isUsedWell(plates[p].wells[id])), rng)
                     .map((id) => ({ plate: plates[p].name, id, well: plates[p].wells[id] })));
         };
@@ -312,8 +373,10 @@
             groupsText: 'Control\nTreatment A\nTreatment B\nTreatment C',
             replicates: 3,
             timepointsText: '',
+            experiments: 1,
             excludeEdges: false,
             balancePositions: true,
+            rotatePositions: true,
             seed: randomSeed(),
         };
 
@@ -335,11 +398,11 @@
         const sectionLabel = 'text-[11px] font-black text-slate-400 uppercase mb-3 block tracking-widest';
         const textInput = 'w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 shadow-sm';
 
-        const DesignPanel = ({ design, onChange, plateSize, onGenerate }) => {
+        const DesignPanel = ({ design, onChange, plateSize, onGenerate, isGenerating }) => {
             const groups = parseList(design.groupsText, /\r?\n/);
             const timepoints = parseList(design.timepointsText, ',');
             const { slots, wellsPerSet, platesPerSet } = planDesign({ groups, replicates: design.replicates, plateSize, excludeEdges: design.excludeEdges });
-            const setCount = Math.max(timepoints.length, 1);
+            const setCount = designSetNames(design.experiments, timepoints).length;
             const canGenerate = groups.length > 0 && design.replicates > 0 && slots.length > 0;
             const update = (patch) => onChange({ ...design, ...patch });
 
@@ -370,6 +433,17 @@
                             />
                         </label>
                         <label className="text-xs font-bold text-slate-500">
+                            Experiments
+                            <input
+                                type="number"
+                                min={1}
+                                value={design.experiments}
+                                onChange={(e) => update({ experiments: Math.max(1, Number(e.target.value) || 1) })}
+                                className={`${textInput} mt-1`}
+                                title="独立実験の回数（実験ごとにプレートセットを作成）"
+                            />
+                        </label>
+                        <label className="text-xs font-bold text-slate-500 col-span-2">
                             Seed
                             <div className="flex gap-1 mt-1">
                                 <input
@@ -414,18 +488,35 @@
                         />
                         Balance positions（外周比率・行列・隣接）
                     </label>
+                    <label className="flex items-center gap-2 text-xs font-bold text-slate-500">
+                        <input
+                            type="checkbox"
+                            checked={design.rotatePositions}
+                            onChange={(e) => update({ rotatePositions: e.target.checked })}
+                        />
+                        Rotate positions across plates（ランダム化ラテン方格）
+                    </label>
                     <p className="text-xs text-slate-500 bg-slate-50 rounded-xl p-3 border border-slate-200">
                         {slots.length === 0
                             ? 'このフォーマットでは使用できるウェルがありません。'
-                            : `${groups.length}群 × N=${design.replicates}${timepoints.length > 0 ? ` × ${setCount}時点` : ''} = ${wellsPerSet * setCount} wells → ${plateSize}-well × ${platesPerSet * setCount}枚`}
+                            : `${groups.length}群 × N=${design.replicates}${design.experiments > 1 ? ` × ${design.experiments}実験` : ''}${timepoints.length > 0 ? ` × ${timepoints.length}時点` : ''} = ${wellsPerSet * setCount} wells → ${plateSize}-well × ${platesPerSet * setCount}枚`}
                     </p>
                     <button
-                        onClick={() => onGenerate({ groups, replicates: design.replicates, timepoints, excludeEdges: design.excludeEdges, balancePositions: design.balancePositions, seed: design.seed })}
-                        disabled={!canGenerate}
+                        onClick={() => onGenerate({
+                            groups,
+                            replicates: design.replicates,
+                            experiments: design.experiments,
+                            timepoints,
+                            excludeEdges: design.excludeEdges,
+                            balancePositions: design.balancePositions,
+                            rotatePositions: design.rotatePositions,
+                            seed: design.seed,
+                        })}
+                        disabled={!canGenerate || isGenerating}
                         className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 rounded-2xl transition-all disabled:opacity-40"
                     >
                         <Shuffle size={16} />
-                        Generate Layout
+                        {isGenerating ? 'Generating...' : 'Generate Layout'}
                     </button>
                 </div>
             );
@@ -454,6 +545,7 @@
                                     <th className="py-2 pr-4">Edge wells（実測 / 期待）</th>
                                     <th className="py-2 pr-4">Same row/col</th>
                                     <th className="py-2 pr-4">Adjacent</th>
+                                    <th className="py-2 pr-4">Same position</th>
                                     <th className="py-2">Plates（使用 / 最大）</th>
                                 </tr>
                             </thead>
@@ -481,6 +573,9 @@
                                                 {g.linePairs} <span className="text-slate-400 font-medium">（最小 {g.minLinePairs}）</span>
                                             </td>
                                             <td className={`py-2 pr-4 ${g.adjacentPairs > 0 ? warn : ok}`}>{g.adjacentPairs}</td>
+                                            <td className={`py-2 pr-4 ${g.positionRepeats > g.minPositionRepeats ? warn : ok}`}>
+                                                {g.positionRepeats} <span className="text-slate-400 font-medium">（最小 {g.minPositionRepeats}）</span>
+                                            </td>
                                             <td className="py-2 text-slate-600">{g.platesUsed} / {g.maxPerPlate} per plate</td>
                                         </tr>
                                     );
@@ -489,7 +584,7 @@
                         </table>
                     </div>
                     <p className="mt-3 text-xs text-slate-400">
-                        Edge: 外周ウェル数（期待値 = 全体の外周比率 × N、差が1を超えると警告）。Same row/col: 同一プレートで同じ行・列に並ぶペア数（ウェル数から避けられない最小値を超えると警告）。Adjacent: 上下左右に隣接するペア数。
+                        Edge: 外周ウェル数（期待値 = 全体の外周比率 × N、差が1を超えると警告）。Same row/col: 同一プレートで同じ行・列に並ぶペア数（ウェル数から避けられない最小値を超えると警告）。Adjacent: 上下左右に隣接するペア数。Same position: 別のプレートで同じウェル位置に入ったペア数。
                     </p>
                 </div>
             );
@@ -605,6 +700,7 @@
             const [selectedColor, setSelectedColor] = useState(WELL_COLORS[1].value);
             const [activeWell, setActiveWell] = useState(null);
             const [isExporting, setIsExporting] = useState(false);
+            const [isGenerating, setIsGenerating] = useState(false);
             const [isDragging, setIsDragging] = useState(false);
             const [groupLabelInput, setGroupLabelInput] = useState('');
 
@@ -730,9 +826,20 @@
                 if (hasData() && !confirm('現在のプレートを上書きして、ランダム配置を生成しますか？')) {
                     return;
                 }
-                setPlates(generateDesign({ ...params, plateSize }));
-                setDesignNote(`${params.groups.length} groups × N=${params.replicates}${params.excludeEdges ? ' · edge wells excluded' : ''}${params.balancePositions ? ' · position-balanced' : ''} · seed ${params.seed}`);
-                setActiveWell(null);
+                setIsGenerating(true);
+                // Defer so the "Generating..." state paints before the search blocks the thread
+                setTimeout(() => {
+                    setPlates(generateDesign({ ...params, plateSize }));
+                    setDesignNote([
+                        `${params.groups.length} groups × N=${params.replicates}${params.experiments > 1 ? ` × ${params.experiments} experiments` : ''}`,
+                        params.excludeEdges && 'edge wells excluded',
+                        params.balancePositions && 'position-balanced',
+                        params.rotatePositions && 'positions rotated across plates',
+                        `seed ${params.seed}`,
+                    ].filter(Boolean).join(' · '));
+                    setActiveWell(null);
+                    setIsGenerating(false);
+                }, 30);
             };
 
             const exportToCSV = () => {
@@ -869,6 +976,7 @@
                                         onChange={setDesign}
                                         plateSize={plateSize}
                                         onGenerate={handleGenerate}
+                                        isGenerating={isGenerating}
                                     />
 
                                     {/* Palette */}
