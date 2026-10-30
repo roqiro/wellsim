@@ -5,15 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Plate Designer</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
     <style>
         .show-on-export { display: none; }
-        @media screen {
-            .html2canvas-container .show-on-export { 
-                display: block !important; 
-            }
+        .well-button { touch-action: none; }
+        .exporting .well-button[data-active="true"] {
+            transform: none;
+            border-color: #f1f5f9;
+            box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
         }
         .select-none {
             user-select: none;
@@ -79,10 +80,40 @@
             { name: 'Indigo', value: '#6366f1' },
         ];
 
+        const STORAGE_KEY = 'wellsim:v1';
+
+        const parseWellId = (id) => {
+            const match = /^([A-Z])(\d{1,2})$/.exec(id);
+            if (!match) return null;
+            return { row: match[1].charCodeAt(0) - 64, col: Number(match[2]) };
+        };
+
+        const fitsPlate = (id, size) => {
+            const pos = parseWellId(id);
+            const { rows, cols } = PLATE_CONFIGS[size];
+            return pos !== null && pos.row <= rows && pos.col >= 1 && pos.col <= cols;
+        };
+
+        const smallestPlateFor = (ids) =>
+            Object.keys(PLATE_CONFIGS)
+                .map(Number)
+                .find((size) => ids.every((id) => fitsPlate(id, size)));
+
+        const isUsedWell = (well) => well.color !== '#ffffff' || well.label !== '';
+
+        const loadSavedState = () => {
+            try {
+                const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+                if (saved && PLATE_CONFIGS[saved.plateSize] && saved.wells) return saved;
+            } catch (e) {}
+            return { plateSize: 24, wells: {} };
+        };
+
         const App = () => {
-            const [plateSize, setPlateSize] = useState(24);
+            const [initialState] = useState(loadSavedState);
+            const [plateSize, setPlateSize] = useState(initialState.plateSize);
             const [selectedColor, setSelectedColor] = useState(WELL_COLORS[1].value);
-            const [wells, setWells] = useState({}); 
+            const [wells, setWells] = useState(initialState.wells);
             const [activeWellId, setActiveWellId] = useState(null);
             const [isExporting, setIsExporting] = useState(false);
             const [isDragging, setIsDragging] = useState(false);
@@ -96,10 +127,31 @@
             const colLabels = Array.from({ length: config.cols }, (_, i) => i + 1);
 
             useEffect(() => {
-                const handleGlobalMouseUp = () => setIsDragging(false);
-                window.addEventListener('mouseup', handleGlobalMouseUp);
-                return () => window.removeEventListener('mouseup', handleGlobalMouseUp);
+                const handleGlobalPointerUp = () => setIsDragging(false);
+                window.addEventListener('pointerup', handleGlobalPointerUp);
+                window.addEventListener('pointercancel', handleGlobalPointerUp);
+                return () => {
+                    window.removeEventListener('pointerup', handleGlobalPointerUp);
+                    window.removeEventListener('pointercancel', handleGlobalPointerUp);
+                };
             }, []);
+
+            useEffect(() => {
+                try {
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify({ plateSize, wells }));
+                } catch (e) {}
+            }, [plateSize, wells]);
+
+            const changePlateSize = (size) => {
+                if (size === plateSize) return;
+                const lost = Object.keys(wells).filter((id) => isUsedWell(wells[id]) && !fitsPlate(id, size));
+                if (lost.length > 0 && !confirm(`${size}ウェルに収まらない ${lost.length} 個のウェル（${lost.slice(0, 5).join(', ')}${lost.length > 5 ? ' ...' : ''}）のデータが削除されます。続けますか？`)) {
+                    return;
+                }
+                setWells((prev) => Object.fromEntries(Object.entries(prev).filter(([id]) => fitsPlate(id, size))));
+                if (activeWellId && !fitsPlate(activeWellId, size)) setActiveWellId(null);
+                setPlateSize(size);
+            };
 
             const updateWellColor = (id, color) => {
                 setWells((prev) => ({
@@ -112,14 +164,18 @@
                 }));
             };
 
-            const handleWellMouseDown = (id) => {
+            const handleWellPointerDown = (e, id) => {
+                // Release implicit touch capture so pointerenter fires on neighbouring wells
+                if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                    e.currentTarget.releasePointerCapture(e.pointerId);
+                }
                 setIsDragging(true);
                 setActiveWellId(id);
                 const newColor = wells[id]?.color === selectedColor && selectedColor !== '#ffffff' ? '#ffffff' : selectedColor;
                 updateWellColor(id, newColor);
             };
 
-            const handleWellMouseEnter = (id) => {
+            const handleWellPointerEnter = (id) => {
                 if (isDragging) {
                     updateWellColor(id, selectedColor);
                 }
@@ -141,15 +197,12 @@
                 if (selectedColor === '#ffffff') {
                     return;
                 }
-                setWells((prev) => {
-                    const next = { ...prev };
-                    Object.keys(next).forEach((id) => {
-                        if (next[id].color === selectedColor) {
-                            next[id].label = groupLabelInput;
-                        }
-                    });
-                    return next;
-                });
+                setWells((prev) => Object.fromEntries(
+                    Object.entries(prev).map(([id, well]) => [
+                        id,
+                        well.color === selectedColor ? { ...well, label: groupLabelInput } : well
+                    ])
+                ));
                 setGroupLabelInput('');
             };
 
@@ -188,14 +241,18 @@
                     
                     for (let i = 1; i < lines.length; i++) {
                         if (!lines[i].trim()) continue;
-                        const [id, color, label] = lines[i].split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
-                        if (id) {
+                        const [rawId, color, label] = lines[i].split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
+                        const id = (rawId || '').trim().toUpperCase();
+                        if (fitsPlate(id, 96)) {
                             newWells[id] = {
-                                color: color || '#ffffff',
+                                color: color?.trim() || '#ffffff',
                                 label: label ? label.replace(/^"|"$/g, '').replace(/""/g, '"') : ''
                             };
                         }
                     }
+                    const size = smallestPlateFor(Object.keys(newWells));
+                    if (size > plateSize) setPlateSize(size);
+                    setActiveWellId(null);
                     setWells(newWells);
                 };
                 reader.readAsText(file);
@@ -216,6 +273,12 @@
                         backgroundColor: '#ffffff',
                         scale: 2,
                         logging: false,
+                        onclone: (doc) => {
+                            doc.body.classList.add('exporting');
+                            doc.querySelectorAll('.show-on-export').forEach((el) => {
+                                el.style.display = 'block';
+                            });
+                        },
                     });
                     const link = document.createElement('a');
                     link.download = `plate_image_${plateSize}well.png`;
@@ -250,7 +313,7 @@
                                             {[6, 12, 24, 48, 96].map((size) => (
                                                 <button
                                                     key={size}
-                                                    onClick={() => setPlateSize(size)}
+                                                    onClick={() => changePlateSize(size)}
                                                     className={`py-2.5 rounded-xl text-sm font-bold transition-all ${
                                                         plateSize === size 
                                                             ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-200 scale-105' 
@@ -385,7 +448,7 @@
 
                                 <div ref={plateRef} className="bg-white p-8">
                                     {/* Header for PNG Export only */}
-                                    <div className="hidden show-on-export mb-8 text-center">
+                                    <div className="show-on-export mb-8 text-center">
                                         <h2 className="text-2xl font-black text-slate-900">{plateSize}-Well Experimental Layout</h2>
                                         <p className="text-slate-400 font-medium">Generated via Professional Plate Designer • {new Date().toDateString()}</p>
                                     </div>
@@ -416,15 +479,16 @@
                                                         const isActive = activeWellId === id;
                                                         
                                                         const wellClass = plateSize > 48 ? 'w-10 h-10' : plateSize > 24 ? 'w-12 h-12' : 'w-16 h-16';
-                                                        const labelClass = plateSize > 48 ? 'text-[7px]' : 'text-[9px]';
+                                                        const labelClass = plateSize > 48 ? 'w-10 text-[7px]' : plateSize > 24 ? 'w-12 text-[9px]' : 'w-16 text-[9px]';
 
                                                         return (
                                                             <div key={id} className="relative flex flex-col items-center">
                                                                 <button
-                                                                    onMouseDown={() => handleWellMouseDown(id)}
-                                                                    onMouseEnter={() => handleWellMouseEnter(id)}
+                                                                    onPointerDown={(e) => handleWellPointerDown(e, id)}
+                                                                    onPointerEnter={() => handleWellPointerEnter(id)}
+                                                                    data-active={isActive}
                                                                     className={`
-                                                                        ${wellClass} rounded-full border-2 transition-all duration-150 
+                                                                        well-button ${wellClass} rounded-full border-2 transition-all duration-150 
                                                                         flex flex-col items-center justify-center relative shadow-sm cursor-crosshair
                                                                         ${isActive ? 'ring-4 ring-indigo-100 border-indigo-600 scale-110 z-20' : 'border-slate-100 hover:border-slate-300'}
                                                                     `}
@@ -440,7 +504,7 @@
                                                                 {/* Visual Label */}
                                                                 {wellData.label && (
                                                                     <div className={`
-                                                                        absolute top-[105%] w-16 text-center leading-tight font-bold text-slate-500 truncate
+                                                                        absolute top-[105%] text-center leading-tight font-bold text-slate-500 truncate
                                                                         ${labelClass}
                                                                     `}>
                                                                         {wellData.label}
@@ -464,7 +528,7 @@
                                     </div>
                                     <div className="flex flex-col">
                                         <span className="text-[10px] font-black text-slate-400 uppercase">Occupancy</span>
-                                        <span className="text-sm font-bold text-indigo-600">{Object.keys(wells).filter(k => wells[k].color !== '#ffffff').length} Positions</span>
+                                        <span className="text-sm font-bold text-indigo-600">{Object.keys(wells).filter(k => wells[k].color !== '#ffffff' && fitsPlate(k, plateSize)).length} Positions</span>
                                     </div>
                                 </div>
                                 <div className="text-[11px] font-bold text-slate-300 flex items-center gap-2">
