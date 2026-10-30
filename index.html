@@ -171,20 +171,123 @@
             return plates;
         };
 
-        const generateDesign = ({ groups, replicates, timepoints, plateSize, excludeEdges, seed }) => {
+        const groupKeyOf = (well) => well.label || WELL_COLORS.find((c) => c.value === well.color)?.name || well.color;
+
+        // Fewest same-line pairs possible when k wells are spread over n lines
+        const minLinePairs = (k, n) => {
+            if (k === 0) return 0;
+            const q = Math.floor(k / n);
+            const r = k % n;
+            return r * ((q + 1) * q) / 2 + (n - r) * (q * (q - 1)) / 2;
+        };
+
+        // Per-group position metrics; penalty is what constrained randomization minimises
+        const analyzeBalance = (plates, plateSize) => {
+            const groups = new Map();
+            const occupiedLines = plates.map(() => ({ rows: new Set(), cols: new Set() }));
+            let used = 0;
+            let usedEdge = 0;
+            plates.forEach((plate, p) => {
+                const lineCounts = new Map();
+                Object.entries(plate.wells).forEach(([id, well]) => {
+                    if (!isUsedWell(well) || !fitsPlate(id, plateSize)) return;
+                    const key = groupKeyOf(well);
+                    const group = groups.get(key) || { key, color: well.color, count: 0, edge: 0, linePairs: 0, adjacentPairs: 0, perPlate: plates.map(() => 0) };
+                    const { row, col } = parseWellId(id);
+                    const edge = isEdgeWell(id, plateSize);
+                    group.count++;
+                    group.edge += edge ? 1 : 0;
+                    group.perPlate[p]++;
+                    occupiedLines[p].rows.add(row);
+                    occupiedLines[p].cols.add(col);
+                    [`r${row}`, `c${col}`].forEach((line) => {
+                        const lineKey = `${key}|${line}`;
+                        const seen = lineCounts.get(lineKey) || 0;
+                        group.linePairs += seen;
+                        lineCounts.set(lineKey, seen + 1);
+                    });
+                    [`${String.fromCharCode(65 + row)}${col}`, `${String.fromCharCode(64 + row)}${col + 1}`].forEach((neighborId) => {
+                        const neighbor = plate.wells[neighborId];
+                        if (neighbor && isUsedWell(neighbor) && groupKeyOf(neighbor) === key) group.adjacentPairs++;
+                    });
+                    used++;
+                    usedEdge += edge ? 1 : 0;
+                    groups.set(key, group);
+                });
+            });
+            const edgeShare = used > 0 ? usedEdge / used : 0;
+            const rows = [...groups.values()].map((group) => ({
+                ...group,
+                expectedEdge: group.count * edgeShare,
+                minLinePairs: group.perPlate.reduce((sum, k, p) =>
+                    sum + minLinePairs(k, occupiedLines[p].rows.size) + minLinePairs(k, occupiedLines[p].cols.size), 0),
+                platesUsed: group.perPlate.filter(Boolean).length,
+                maxPerPlate: Math.max(...group.perPlate),
+            }));
+            const penalty = rows.reduce((sum, g) =>
+                sum + 2 * (g.edge - g.expectedEdge) ** 2 + (g.linePairs - g.minLinePairs) + 2 * g.adjacentPairs, 0);
+            return { rows, edgeShare, penalty };
+        };
+
+        const BALANCE_CANDIDATES = 100;
+        const BALANCE_SWAP_STEPS = 3000;
+
+        // Hill-climb from the best random candidate by swapping two slots within a plate
+        const improveBySwaps = (layout, slots, plateSize, rng) => {
+            let bestPenalty = analyzeBalance(layout, plateSize).penalty;
+            for (let step = 0; step < BALANCE_SWAP_STEPS && bestPenalty > 0; step++) {
+                const wells = layout[Math.floor(rng() * layout.length)].wells;
+                const a = slots[Math.floor(rng() * slots.length)];
+                const b = slots[Math.floor(rng() * slots.length)];
+                if (a === b || wells[a]?.label === wells[b]?.label) continue;
+                const swap = () => {
+                    const [wa, wb] = [wells[a], wells[b]];
+                    if (wb) wells[a] = wb; else delete wells[a];
+                    if (wa) wells[b] = wa; else delete wells[b];
+                };
+                swap();
+                const penalty = analyzeBalance(layout, plateSize).penalty;
+                if (penalty < bestPenalty) bestPenalty = penalty;
+                else swap();
+            }
+            return layout;
+        };
+
+        const generateDesign = ({ groups, replicates, timepoints, plateSize, excludeEdges, balancePositions, seed }) => {
             const rng = createRng(seed);
             const { slots, platesPerSet } = planDesign({ groups, replicates, plateSize, excludeEdges });
             const setNames = timepoints.length > 0 ? timepoints : [''];
-            return setNames.flatMap((setName) =>
-                assignToPlates(groups.length, replicates, platesPerSet, rng).map((groupIndexes, i) => {
+            return setNames.flatMap((setName) => {
+                const plateGroups = assignToPlates(groups.length, replicates, platesPerSet, rng);
+                const buildLayout = () => plateGroups.map((groupIndexes, i) => {
                     const positions = shuffle(slots, rng);
                     const wells = {};
                     groupIndexes.forEach((g, k) => {
                         wells[positions[k]] = { color: GROUP_COLORS[g % GROUP_COLORS.length], label: groups[g] };
                     });
                     return { name: setName ? `${setName}-${i + 1}` : `Plate ${i + 1}`, wells };
-                })
-            );
+                });
+                let best = buildLayout();
+                if (!balancePositions) return best;
+                let bestPenalty = analyzeBalance(best, plateSize).penalty;
+                for (let k = 1; k < BALANCE_CANDIDATES; k++) {
+                    const candidate = buildLayout();
+                    const penalty = analyzeBalance(candidate, plateSize).penalty;
+                    if (penalty < bestPenalty) {
+                        best = candidate;
+                        bestPenalty = penalty;
+                    }
+                }
+                return improveBySwaps(best, slots, plateSize, rng);
+            });
+        };
+
+        // Seeding/measurement order: plates in random order, wells shuffled within each plate
+        const buildWorkOrder = (plates, plateSize, seed) => {
+            const rng = createRng(seed ^ 0x5bd1e995);
+            return shuffle([...plates.keys()], rng).flatMap((p) =>
+                shuffle(wellIdsFor(plateSize).filter((id) => plates[p].wells[id] && isUsedWell(plates[p].wells[id])), rng)
+                    .map((id) => ({ plate: plates[p].name, id, well: plates[p].wells[id] })));
         };
 
         const buildLegend = (plates) => {
@@ -210,6 +313,7 @@
             replicates: 3,
             timepointsText: '',
             excludeEdges: false,
+            balancePositions: true,
             seed: randomSeed(),
         };
 
@@ -302,19 +406,91 @@
                         />
                         Exclude edge wells
                     </label>
+                    <label className="flex items-center gap-2 text-xs font-bold text-slate-500">
+                        <input
+                            type="checkbox"
+                            checked={design.balancePositions}
+                            onChange={(e) => update({ balancePositions: e.target.checked })}
+                        />
+                        Balance positions（外周比率・行列・隣接）
+                    </label>
                     <p className="text-xs text-slate-500 bg-slate-50 rounded-xl p-3 border border-slate-200">
                         {slots.length === 0
                             ? 'このフォーマットでは使用できるウェルがありません。'
                             : `${groups.length}群 × N=${design.replicates}${timepoints.length > 0 ? ` × ${setCount}時点` : ''} = ${wellsPerSet * setCount} wells → ${plateSize}-well × ${platesPerSet * setCount}枚`}
                     </p>
                     <button
-                        onClick={() => onGenerate({ groups, replicates: design.replicates, timepoints, excludeEdges: design.excludeEdges, seed: design.seed })}
+                        onClick={() => onGenerate({ groups, replicates: design.replicates, timepoints, excludeEdges: design.excludeEdges, balancePositions: design.balancePositions, seed: design.seed })}
                         disabled={!canGenerate}
                         className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 rounded-2xl transition-all disabled:opacity-40"
                     >
                         <Shuffle size={16} />
                         Generate Layout
                     </button>
+                </div>
+            );
+        };
+
+        const percent = (value) => `${Math.round(value * 100)}%`;
+
+        const BalancePanel = ({ balance }) => {
+            if (balance.rows.length === 0) return null;
+            const warn = 'text-amber-600 font-black';
+            const ok = 'text-slate-600';
+            return (
+                <div className="mt-10 pt-8 border-t border-slate-100">
+                    <div className="flex flex-wrap items-baseline justify-between gap-2 mb-4">
+                        <span className={`${sectionLabel} mb-0`}>Position Balance</span>
+                        <span className="text-xs font-bold text-slate-400">
+                            外周ウェル比率 {percent(balance.edgeShare)} · penalty {balance.penalty.toFixed(1)}（小さいほど均等・0 が理想）
+                        </span>
+                    </div>
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                            <thead>
+                                <tr className="text-left text-[11px] font-black text-slate-400 uppercase tracking-wider">
+                                    <th className="py-2 pr-4">Group</th>
+                                    <th className="py-2 pr-4">N</th>
+                                    <th className="py-2 pr-4">Edge wells（実測 / 期待）</th>
+                                    <th className="py-2 pr-4">Same row/col</th>
+                                    <th className="py-2 pr-4">Adjacent</th>
+                                    <th className="py-2">Plates（使用 / 最大）</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {balance.rows.map((g) => {
+                                    const edgeOff = Math.abs(g.edge - g.expectedEdge) > 1;
+                                    const actualShare = g.count > 0 ? g.edge / g.count : 0;
+                                    return (
+                                        <tr key={g.key} className="border-t border-slate-100">
+                                            <td className="py-2 pr-4 font-bold text-slate-700">
+                                                <span className="inline-block w-3 h-3 rounded-full mr-2 align-middle border border-slate-200" style={{ backgroundColor: g.color }}></span>
+                                                {g.key}
+                                            </td>
+                                            <td className="py-2 pr-4 text-slate-600">{g.count}</td>
+                                            <td className="py-2 pr-4">
+                                                <div className="flex items-center gap-3">
+                                                    <div className="relative w-24 h-2 rounded-full bg-slate-100">
+                                                        <div className="absolute inset-y-0 left-0 rounded-full bg-indigo-400" style={{ width: percent(actualShare) }}></div>
+                                                        <div className="absolute -inset-y-1 w-0.5 bg-slate-700" style={{ left: percent(balance.edgeShare) }} title="期待値"></div>
+                                                    </div>
+                                                    <span className={edgeOff ? warn : ok}>{g.edge} / {g.expectedEdge.toFixed(1)}</span>
+                                                </div>
+                                            </td>
+                                            <td className={`py-2 pr-4 ${g.linePairs > g.minLinePairs ? warn : ok}`}>
+                                                {g.linePairs} <span className="text-slate-400 font-medium">（最小 {g.minLinePairs}）</span>
+                                            </td>
+                                            <td className={`py-2 pr-4 ${g.adjacentPairs > 0 ? warn : ok}`}>{g.adjacentPairs}</td>
+                                            <td className="py-2 text-slate-600">{g.platesUsed} / {g.maxPerPlate} per plate</td>
+                                        </tr>
+                                    );
+                                })}
+                            </tbody>
+                        </table>
+                    </div>
+                    <p className="mt-3 text-xs text-slate-400">
+                        Edge: 外周ウェル数（期待値 = 全体の外周比率 × N、差が1を超えると警告）。Same row/col: 同一プレートで同じ行・列に並ぶペア数（ウェル数から避けられない最小値を超えると警告）。Adjacent: 上下左右に隣接するペア数。
+                    </p>
                 </div>
             );
         };
@@ -437,6 +613,7 @@
 
             const activeData = activeWell ? plates[activeWell.plate]?.wells[activeWell.id] : null;
             const legend = buildLegend(plates);
+            const balance = analyzeBalance(plates, plateSize);
             const occupancy = plates.reduce((sum, plate) =>
                 sum + Object.values(plate.wells).filter((w) => w.color !== BLANK).length, 0);
 
@@ -554,7 +731,7 @@
                     return;
                 }
                 setPlates(generateDesign({ ...params, plateSize }));
-                setDesignNote(`${params.groups.length} groups × N=${params.replicates}${params.excludeEdges ? ' · edge wells excluded' : ''} · seed ${params.seed}`);
+                setDesignNote(`${params.groups.length} groups × N=${params.replicates}${params.excludeEdges ? ' · edge wells excluded' : ''}${params.balancePositions ? ' · position-balanced' : ''} · seed ${params.seed}`);
                 setActiveWell(null);
             };
 
@@ -573,6 +750,20 @@
                 link.click();
             };
 
+            const exportWorkOrder = () => {
+                const headers = ['Order', 'Plate', 'Well_ID', 'Label', 'Color_HEX', 'Done'];
+                const rows = buildWorkOrder(plates, plateSize, design.seed).map((step, i) =>
+                    [i + 1, csvField(step.plate), step.id, csvField(step.well.label || ''), step.well.color, ''].join(','));
+                // BOM so Excel opens Japanese labels correctly
+                const csvContent = '﻿' + [headers.join(','), ...rows].join('\n');
+
+                const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(blob);
+                link.download = `work_order_seed${design.seed}_${new Date().toISOString().split('T')[0]}.csv`;
+                link.click();
+            };
+
             const importFromCSV = (event) => {
                 const file = event.target.files[0];
                 if (!file) return;
@@ -580,7 +771,7 @@
                 const reader = new FileReader();
                 reader.onload = (e) => {
                     const lines = e.target.result.split(/\r?\n/);
-                    const hasPlateColumn = splitCsvLine(lines[0] || '')[0].toLowerCase() === 'plate';
+                    const hasPlateColumn = splitCsvLine((lines[0] || '').replace(/^﻿/, ''))[0].toLowerCase() === 'plate';
                     const byName = new Map();
 
                     for (let i = 1; i < lines.length; i++) {
@@ -784,6 +975,16 @@
                                     </div>
 
                                     <button
+                                        onClick={exportWorkOrder}
+                                        disabled={legend.length === 0}
+                                        className="w-full flex items-center justify-center gap-2 bg-white border border-slate-200 hover:border-indigo-400 text-slate-700 font-bold py-3 rounded-2xl transition-all disabled:opacity-40"
+                                        title={`Seed ${design.seed} でプレート順・ウェル順をランダム化`}
+                                    >
+                                        <Shuffle size={16} />
+                                        Work Order CSV
+                                    </button>
+
+                                    <button
                                         onClick={resetPlates}
                                         className="w-full flex items-center justify-center gap-2 text-rose-500 hover:bg-rose-50 font-bold py-2 rounded-xl transition-all mt-2"
                                     >
@@ -841,6 +1042,8 @@
                                         + Add Plate
                                     </button>
                                 </div>
+
+                                <BalancePanel balance={balance} />
                             </div>
 
                             <div className="mt-8 flex justify-between items-center px-4">
