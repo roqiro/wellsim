@@ -152,8 +152,10 @@
 
         const parseList = (text, separator) => text.split(separator).map((s) => s.trim()).filter(Boolean);
 
-        const planDesign = ({ groups, replicates, plateSize, excludeEdges }) => {
-            const slots = wellIdsFor(plateSize).filter((id) => !(excludeEdges && isEdgeWell(id, plateSize)));
+        const planDesign = ({ groups, replicates, plateSize, excludeEdges, disabledWells = [] }) => {
+            const disabled = new Set(disabledWells);
+            const slots = wellIdsFor(plateSize).filter((id) =>
+                !disabled.has(id) && !(excludeEdges && isEdgeWell(id, plateSize)));
             const wellsPerSet = groups.length * replicates;
             const platesPerSet = slots.length > 0 ? Math.ceil(wellsPerSet / slots.length) : 0;
             return { slots, wellsPerSet, platesPerSet };
@@ -293,9 +295,9 @@
         // Sets are optimised one after another so that later plates avoid the positions
         // each group already took on earlier plates (randomized Latin-square-like rotation),
         // then a whole-design pass repairs dead ends left by the sequential greedy step
-        const generateDesign = ({ groups, replicates, experiments, timepoints, plateSize, excludeEdges, balancePositions, rotatePositions, seed }) => {
+        const generateDesign = ({ groups, replicates, experiments, timepoints, plateSize, excludeEdges, disabledWells, balancePositions, rotatePositions, seed }) => {
             const rng = createRng(seed);
-            const { slots, platesPerSet } = planDesign({ groups, replicates, plateSize, excludeEdges });
+            const { slots, platesPerSet } = planDesign({ groups, replicates, plateSize, excludeEdges, disabledWells });
             const optimize = balancePositions || rotatePositions;
             const plates = designSetNames(experiments, timepoints).reduce((done, setName) => {
                 const { counts: prior } = tallyPositions(done);
@@ -375,6 +377,7 @@
             timepointsText: '',
             experiments: 1,
             excludeEdges: false,
+            disabledWells: {},
             balancePositions: true,
             rotatePositions: true,
             seed: randomSeed(),
@@ -398,10 +401,58 @@
         const sectionLabel = 'text-[11px] font-black text-slate-400 uppercase mb-3 block tracking-widest';
         const textInput = 'w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 shadow-sm';
 
+        // Lets a plan use only part of each plate, e.g. the top row of a 6-well plate
+        const UsableWellsPicker = ({ plateSize, disabledWells, onChange }) => {
+            const { rows, cols } = PLATE_CONFIGS[plateSize];
+            const ids = wellIdsFor(plateSize);
+            const disabled = new Set(disabledWells);
+            const half = Math.ceil(rows / 2);
+            const presets = [
+                ['All', []],
+                ['Top half', ids.filter((id) => parseWellId(id).row > half)],
+                ['Bottom half', ids.filter((id) => parseWellId(id).row <= rows - half)],
+            ];
+            const dotClass = plateSize >= 48 ? 'w-3 h-3' : plateSize >= 24 ? 'w-4 h-4' : 'w-6 h-6';
+            const toggle = (id) => onChange(disabled.has(id) ? disabledWells.filter((x) => x !== id) : [...disabledWells, id]);
+
+            return (
+                <div>
+                    <div className="flex items-baseline justify-between">
+                        <span className="text-xs font-bold text-slate-500">Usable wells（クリックで切替）</span>
+                        <span className="text-xs font-bold text-indigo-600">{ids.length - disabled.size}/{ids.length}</span>
+                    </div>
+                    <div className="mt-2 inline-grid gap-1 p-2 rounded-xl bg-slate-50 border border-slate-200" style={{ gridTemplateColumns: `repeat(${cols}, auto)` }}>
+                        {ids.map((id) => (
+                            <button
+                                key={id}
+                                onClick={() => toggle(id)}
+                                title={id}
+                                className={`${dotClass} rounded-full border transition-all ${
+                                    disabled.has(id) ? 'bg-white border-dashed border-slate-300' : 'bg-indigo-500 border-indigo-500'
+                                }`}
+                            />
+                        ))}
+                    </div>
+                    <div className="flex gap-1 mt-2">
+                        {presets.map(([label, next]) => (
+                            <button
+                                key={label}
+                                onClick={() => onChange(next)}
+                                className="px-2 py-1 rounded-lg text-[11px] font-bold bg-white border border-slate-200 text-slate-500 hover:border-indigo-400"
+                            >
+                                {label}
+                            </button>
+                        ))}
+                    </div>
+                </div>
+            );
+        };
+
         const DesignPanel = ({ design, onChange, plateSize, onGenerate, isGenerating }) => {
             const groups = parseList(design.groupsText, /\r?\n/);
             const timepoints = parseList(design.timepointsText, ',');
-            const { slots, wellsPerSet, platesPerSet } = planDesign({ groups, replicates: design.replicates, plateSize, excludeEdges: design.excludeEdges });
+            const disabledWells = (design.disabledWells[plateSize] || []).filter((id) => fitsPlate(id, plateSize));
+            const { slots, wellsPerSet, platesPerSet } = planDesign({ groups, replicates: design.replicates, plateSize, excludeEdges: design.excludeEdges, disabledWells });
             const setCount = designSetNames(design.experiments, timepoints).length;
             const canGenerate = groups.length > 0 && design.replicates > 0 && slots.length > 0;
             const update = (patch) => onChange({ ...design, ...patch });
@@ -480,6 +531,11 @@
                         />
                         Exclude edge wells
                     </label>
+                    <UsableWellsPicker
+                        plateSize={plateSize}
+                        disabledWells={disabledWells}
+                        onChange={(next) => update({ disabledWells: { ...design.disabledWells, [plateSize]: next } })}
+                    />
                     <label className="flex items-center gap-2 text-xs font-bold text-slate-500">
                         <input
                             type="checkbox"
@@ -499,7 +555,7 @@
                     <p className="text-xs text-slate-500 bg-slate-50 rounded-xl p-3 border border-slate-200">
                         {slots.length === 0
                             ? 'このフォーマットでは使用できるウェルがありません。'
-                            : `${groups.length}群 × N=${design.replicates}${design.experiments > 1 ? ` × ${design.experiments}実験` : ''}${timepoints.length > 0 ? ` × ${timepoints.length}時点` : ''} = ${wellsPerSet * setCount} wells → ${plateSize}-well × ${platesPerSet * setCount}枚`}
+                            : `${groups.length}群 × N=${design.replicates}${design.experiments > 1 ? ` × ${design.experiments}実験` : ''}${timepoints.length > 0 ? ` × ${timepoints.length}時点` : ''} = ${wellsPerSet * setCount} wells → ${plateSize}-well（${slots.length}ウェル使用）× ${platesPerSet * setCount}枚`}
                     </p>
                     <button
                         onClick={() => onGenerate({
@@ -508,6 +564,8 @@
                             experiments: design.experiments,
                             timepoints,
                             excludeEdges: design.excludeEdges,
+                            disabledWells,
+                            usableWells: slots.length,
                             balancePositions: design.balancePositions,
                             rotatePositions: design.rotatePositions,
                             seed: design.seed,
@@ -590,7 +648,7 @@
             );
         };
 
-        const PlateGrid = ({ plate, plateIndex, plateSize, activeId, canRemove, onWellPointerDown, onWellPointerEnter, onRename, onRemove }) => {
+        const PlateGrid = ({ plate, plateIndex, plateSize, activeId, unusedWells, canRemove, onWellPointerDown, onWellPointerEnter, onRename, onRemove }) => {
             const config = PLATE_CONFIGS[plateSize];
             const rowLabels = Array.from({ length: config.rows }, (_, i) => String.fromCharCode(65 + i));
             const colLabels = Array.from({ length: config.cols }, (_, i) => i + 1);
@@ -639,6 +697,7 @@
                                     const id = `${row}${col}`;
                                     const wellData = plate.wells[id] || { color: BLANK, label: '' };
                                     const isActive = activeId === id;
+                                    const isUnused = unusedWells.has(id) && !isUsedWell(wellData);
 
                                     return (
                                         <div key={id} className="relative flex flex-col items-center">
@@ -649,7 +708,7 @@
                                                 className={`
                                                     well-button ${wellClass} rounded-full border-2 transition-all duration-150
                                                     flex flex-col items-center justify-center relative shadow-sm cursor-crosshair
-                                                    ${isActive ? 'ring-4 ring-indigo-100 border-indigo-600 scale-110 z-20' : 'border-slate-100 hover:border-slate-300'}
+                                                    ${isActive ? 'ring-4 ring-indigo-100 border-indigo-600 scale-110 z-20' : isUnused ? 'border-dashed border-slate-300 opacity-40' : 'border-slate-100 hover:border-slate-300'}
                                                 `}
                                                 style={{ backgroundColor: wellData.color }}
                                             >
@@ -710,6 +769,7 @@
             const activeData = activeWell ? plates[activeWell.plate]?.wells[activeWell.id] : null;
             const legend = buildLegend(plates);
             const balance = analyzeBalance(plates, plateSize);
+            const unusedWells = new Set(design.disabledWells[plateSize] || []);
             const occupancy = plates.reduce((sum, plate) =>
                 sum + Object.values(plate.wells).filter((w) => w.color !== BLANK).length, 0);
 
@@ -833,6 +893,7 @@
                     setDesignNote([
                         `${params.groups.length} groups × N=${params.replicates}${params.experiments > 1 ? ` × ${params.experiments} experiments` : ''}`,
                         params.excludeEdges && 'edge wells excluded',
+                        params.disabledWells.length > 0 && `${params.usableWells} of ${plateSize} wells used per plate`,
                         params.balancePositions && 'position-balanced',
                         params.rotatePositions && 'positions rotated across plates',
                         `seed ${params.seed}`,
@@ -1132,6 +1193,7 @@
                                                 plateIndex={i}
                                                 plateSize={plateSize}
                                                 activeId={activeWell?.plate === i ? activeWell.id : null}
+                                                unusedWells={unusedWells}
                                                 canRemove={plates.length > 1}
                                                 onWellPointerDown={handleWellPointerDown}
                                                 onWellPointerEnter={handleWellPointerEnter}
