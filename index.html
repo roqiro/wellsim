@@ -383,8 +383,47 @@
             seed: randomSeed(),
         };
 
+        const LIBRARY_KEY = 'wellsim:library:v1';
+        const BACKUP_FORMAT = 'wellsim-design';
+        const UNTITLED = 'Untitled design';
+
+        const isDesignDoc = (doc) => Boolean(doc && PLATE_CONFIGS[doc.plateSize] && Array.isArray(doc.plates) && doc.plates.length > 0);
+
+        const newDesignId = () => `d${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+
+        const today = () => new Date().toISOString().split('T')[0];
+
+        const safeFileName = (name) => (name.trim() || 'design').replace(/[\\/:*?"<>|\s]+/g, '_');
+
+        const loadLibrary = () => {
+            try {
+                const library = JSON.parse(localStorage.getItem(LIBRARY_KEY));
+                return Array.isArray(library) ? library.filter(isDesignDoc) : [];
+            } catch (e) {
+                return [];
+            }
+        };
+
+        const downloadBackup = (docs, fileName) => {
+            const backup = { format: BACKUP_FORMAT, version: 1, exportedAt: new Date().toISOString(), designs: docs };
+            const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = fileName;
+            link.click();
+        };
+
+        // Accepts a library backup or a single bare design document
+        const parseBackup = (text) => {
+            const data = JSON.parse(text);
+            const docs = data?.format === BACKUP_FORMAT && Array.isArray(data.designs) ? data.designs : [data];
+            return docs.filter(isDesignDoc);
+        };
+
+        const formatSavedAt = (iso) => new Date(iso).toLocaleString('ja-JP', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+
         const loadSavedState = () => {
-            const fallback = { plateSize: 24, plates: [emptyPlate(0)], design: DEFAULT_DESIGN, designNote: '' };
+            const fallback = { plateSize: 24, plates: [emptyPlate(0)], design: DEFAULT_DESIGN, designNote: '', designName: UNTITLED, designId: null };
             try {
                 const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
                 if (saved && PLATE_CONFIGS[saved.plateSize] && Array.isArray(saved.plates) && saved.plates.length > 0) {
@@ -648,6 +687,62 @@
             );
         };
 
+        const DesignLibrary = ({ library, currentId, onOpen, onDelete, onDownload, onDownloadAll, onImport }) => {
+            const smallButton = 'px-2 py-1 rounded-lg text-[11px] font-bold border border-slate-200 bg-white hover:border-indigo-400 text-slate-500';
+            return (
+                <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-200">
+                    <div className="flex items-baseline justify-between">
+                        <label className={sectionLabel}>Saved Designs</label>
+                        <span className="text-[11px] font-bold text-slate-400">{library.length} 件</span>
+                    </div>
+                    {library.length === 0 ? (
+                        <p className="text-xs text-slate-400 text-center py-4">保存したデザインはここに表示されます</p>
+                    ) : (
+                        <ul className="space-y-2 max-h-80 overflow-y-auto">
+                            {library.map((doc) => (
+                                <li
+                                    key={doc.id}
+                                    className={`p-3 rounded-xl border ${doc.id === currentId ? 'border-indigo-300 bg-indigo-50' : 'border-slate-200 bg-slate-50'}`}
+                                >
+                                    <div className="text-sm font-bold text-slate-700 truncate">{doc.name}</div>
+                                    <div className="text-[11px] text-slate-400">
+                                        {doc.plateSize}-well × {doc.plates.length} · {formatSavedAt(doc.savedAt)}
+                                    </div>
+                                    <div className="flex gap-1 mt-2">
+                                        <button onClick={() => onOpen(doc)} disabled={doc.id === currentId} className={`${smallButton} disabled:opacity-40`}>
+                                            {doc.id === currentId ? '編集中' : 'Open'}
+                                        </button>
+                                        <button onClick={() => onDownload(doc)} className={smallButton}>JSON</button>
+                                        <button onClick={() => onDelete(doc)} className={`${smallButton} hover:border-rose-400 hover:text-rose-500`}>Delete</button>
+                                    </div>
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                    <div className="grid grid-cols-2 gap-2 mt-4">
+                        <button
+                            onClick={onDownloadAll}
+                            disabled={library.length === 0}
+                            className="flex items-center justify-center gap-1 bg-white border border-slate-200 hover:border-indigo-400 text-slate-700 font-bold py-2.5 rounded-xl text-xs transition-all disabled:opacity-40"
+                        >
+                            <FileText size={14} />
+                            Backup All
+                        </button>
+                        <button
+                            onClick={onImport}
+                            className="flex items-center justify-center gap-1 bg-white border border-slate-200 hover:border-indigo-400 text-slate-700 font-bold py-2.5 rounded-xl text-xs transition-all"
+                        >
+                            <Upload size={14} />
+                            Import JSON
+                        </button>
+                    </div>
+                    <p className="mt-3 text-[11px] text-slate-400">
+                        ライブラリはこのブラウザ内に保存されます。端末の変更やブラウザのデータ削除に備えて、ときどき Backup All でJSONを保存してください。
+                    </p>
+                </div>
+            );
+        };
+
         const PlateGrid = ({ plate, plateIndex, plateSize, activeId, unusedWells, canRemove, onWellPointerDown, onWellPointerEnter, onRename, onRemove }) => {
             const config = PLATE_CONFIGS[plateSize];
             const rowLabels = Array.from({ length: config.rows }, (_, i) => String.fromCharCode(65 + i));
@@ -756,6 +851,9 @@
             const [plates, setPlates] = useState(initialState.plates);
             const [design, setDesign] = useState(initialState.design);
             const [designNote, setDesignNote] = useState(initialState.designNote);
+            const [designName, setDesignName] = useState(initialState.designName);
+            const [designId, setDesignId] = useState(initialState.designId);
+            const [library, setLibrary] = useState(loadLibrary);
             const [selectedColor, setSelectedColor] = useState(WELL_COLORS[1].value);
             const [activeWell, setActiveWell] = useState(null);
             const [isExporting, setIsExporting] = useState(false);
@@ -765,11 +863,13 @@
 
             const plateRef = useRef(null);
             const fileInputRef = useRef(null);
+            const backupInputRef = useRef(null);
 
             const activeData = activeWell ? plates[activeWell.plate]?.wells[activeWell.id] : null;
             const legend = buildLegend(plates);
             const balance = analyzeBalance(plates, plateSize);
             const unusedWells = new Set(design.disabledWells[plateSize] || []);
+            const savedEntry = library.find((d) => d.id === designId);
             const occupancy = plates.reduce((sum, plate) =>
                 sum + Object.values(plate.wells).filter((w) => w.color !== BLANK).length, 0);
 
@@ -785,9 +885,17 @@
 
             useEffect(() => {
                 try {
-                    localStorage.setItem(STORAGE_KEY, JSON.stringify({ plateSize, plates, design, designNote }));
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify({ plateSize, plates, design, designNote, designName, designId }));
                 } catch (e) {}
-            }, [plateSize, plates, design, designNote]);
+            }, [plateSize, plates, design, designNote, designName, designId]);
+
+            useEffect(() => {
+                try {
+                    localStorage.setItem(LIBRARY_KEY, JSON.stringify(library));
+                } catch (e) {
+                    alert('ライブラリを保存できませんでした（ブラウザの保存容量の上限の可能性があります）。JSONバックアップをダウンロードしてください。');
+                }
+            }, [library]);
 
             const hasData = () => plates.some((plate) => Object.values(plate.wells).some(isUsedWell));
 
@@ -880,6 +988,79 @@
                     setDesignNote('');
                     setActiveWell(null);
                 }
+            };
+
+            const saveToLibrary = () => {
+                const doc = { id: designId || newDesignId(), name: designName.trim() || UNTITLED, savedAt: new Date().toISOString(), plateSize, plates, design, designNote };
+                setDesignId(doc.id);
+                setLibrary((prev) => [doc, ...prev.filter((d) => d.id !== doc.id)]);
+                return doc;
+            };
+
+            const newDesign = () => {
+                if (hasData()) {
+                    if (!confirm('現在のデザインをライブラリに保存し、バックアップ（JSON）をダウンロードしてから新規作成します。よろしいですか？')) {
+                        return;
+                    }
+                    const doc = saveToLibrary();
+                    downloadBackup([doc], `wellsim_${safeFileName(doc.name)}_${today()}.json`);
+                }
+                setPlates([emptyPlate(0)]);
+                setDesignNote('');
+                setDesignName(UNTITLED);
+                setDesignId(null);
+                setDesign((prev) => ({ ...prev, seed: randomSeed() }));
+                setActiveWell(null);
+            };
+
+            const openDesign = (doc) => {
+                if (doc.id === designId) return;
+                // Keep the work in progress before switching away from it
+                if (hasData()) saveToLibrary();
+                setPlateSize(doc.plateSize);
+                setPlates(doc.plates);
+                setDesign({ ...DEFAULT_DESIGN, ...doc.design });
+                setDesignNote(doc.designNote || '');
+                setDesignName(doc.name);
+                setDesignId(doc.id);
+                setActiveWell(null);
+            };
+
+            const deleteDesign = (doc) => {
+                if (!confirm(`「${doc.name}」をライブラリから削除しますか？この操作は元に戻せません。`)) return;
+                setLibrary((prev) => prev.filter((d) => d.id !== doc.id));
+                if (doc.id === designId) setDesignId(null);
+            };
+
+            const importBackup = (event) => {
+                const file = event.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    let docs;
+                    try {
+                        docs = parseBackup(e.target.result);
+                    } catch (err) {
+                        docs = [];
+                    }
+                    if (docs.length === 0) {
+                        alert('読み込めるデザインが見つかりませんでした。wellsim のバックアップ（JSON）を選んでください。');
+                        return;
+                    }
+                    setLibrary((prev) => {
+                        const existing = new Set(prev.map((d) => d.id));
+                        const imported = docs.map((doc) => ({
+                            ...doc,
+                            id: doc.id && !existing.has(doc.id) ? doc.id : newDesignId(),
+                            name: doc.name || UNTITLED,
+                            savedAt: doc.savedAt || new Date().toISOString(),
+                        }));
+                        return [...imported, ...prev];
+                    });
+                    alert(`${docs.length} 件のデザインをライブラリに追加しました。`);
+                };
+                reader.readAsText(file);
+                event.target.value = null;
             };
 
             const handleGenerate = (params) => {
@@ -987,7 +1168,7 @@
                         },
                     });
                     const link = document.createElement('a');
-                    link.download = `plate_image_${plateSize}well_${plates.length}plates.png`;
+                    link.download = `${safeFileName(designName)}_${plateSize}well_${plates.length}plates.png`;
                     link.href = canvas.toDataURL('image/png');
                     link.click();
                 } catch (err) {
@@ -1009,6 +1190,35 @@
                                         <FlaskConical size={24} />
                                     </div>
                                     <h1 className="text-xl font-bold tracking-tight">Plate Designer</h1>
+                                </div>
+
+                                {/* Current design */}
+                                <div className="mb-6 space-y-2">
+                                    <label className={sectionLabel}>Design</label>
+                                    <input
+                                        type="text"
+                                        value={designName}
+                                        onChange={(e) => setDesignName(e.target.value)}
+                                        placeholder={UNTITLED}
+                                        className={textInput}
+                                    />
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <button
+                                            onClick={newDesign}
+                                            className="flex items-center justify-center gap-1 bg-white border border-slate-200 hover:border-indigo-400 text-slate-700 font-bold py-2.5 rounded-xl text-sm transition-all"
+                                        >
+                                            + New Design
+                                        </button>
+                                        <button
+                                            onClick={saveToLibrary}
+                                            className="flex items-center justify-center gap-1 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-700 font-bold py-2.5 rounded-xl text-sm transition-all"
+                                        >
+                                            Save
+                                        </button>
+                                    </div>
+                                    <p className="text-[11px] font-bold text-slate-400">
+                                        {savedEntry ? `ライブラリに保存済み · ${formatSavedAt(savedEntry.savedAt)}` : 'まだ保存されていません'}
+                                    </p>
                                 </div>
 
                                 <div className="space-y-6">
@@ -1162,6 +1372,23 @@
                                     </button>
                                 </div>
                             </div>
+
+                            <DesignLibrary
+                                library={library}
+                                currentId={designId}
+                                onOpen={openDesign}
+                                onDelete={deleteDesign}
+                                onDownload={(doc) => downloadBackup([doc], `wellsim_${safeFileName(doc.name)}_${today()}.json`)}
+                                onDownloadAll={() => downloadBackup(library, `wellsim_library_${today()}.json`)}
+                                onImport={() => backupInputRef.current.click()}
+                            />
+                            <input
+                                type="file"
+                                ref={backupInputRef}
+                                onChange={importBackup}
+                                accept=".json,application/json"
+                                className="hidden"
+                            />
                         </aside>
 
                         {/* Main Viewport */}
@@ -1173,9 +1400,9 @@
                                 <div ref={plateRef} className="bg-white p-8">
                                     {/* Header for PNG Export only */}
                                     <div className="show-on-export mb-8 text-center">
-                                        <h2 className="text-2xl font-black text-slate-900">{plateSize}-Well Experimental Layout</h2>
+                                        <h2 className="text-2xl font-black text-slate-900">{designName.trim() || UNTITLED}</h2>
                                         <p className="text-slate-400 font-medium">
-                                            {plates.length} plate{plates.length > 1 ? 's' : ''}{designNote ? ` · ${designNote}` : ''} • {new Date().toDateString()}
+                                            {plateSize}-well × {plates.length} plate{plates.length > 1 ? 's' : ''}{designNote ? ` · ${designNote}` : ''} • {new Date().toDateString()}
                                         </p>
                                     </div>
 
