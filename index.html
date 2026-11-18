@@ -295,7 +295,9 @@
         // Sets are optimised one after another so that later plates avoid the positions
         // each group already took on earlier plates (randomized Latin-square-like rotation),
         // then a whole-design pass repairs dead ends left by the sequential greedy step
-        const generateDesign = ({ groups, replicates, experiments, timepoints, plateSize, excludeEdges, disabledWells, balancePositions, rotatePositions, seed }) => {
+        const groupColorFor = (groups, g, groupColors = {}) => groupColors[groups[g]] || GROUP_COLORS[g % GROUP_COLORS.length];
+
+        const generateDesign = ({ groups, replicates, experiments, timepoints, plateSize, excludeEdges, disabledWells, groupColors, balancePositions, rotatePositions, seed }) => {
             const rng = createRng(seed);
             const { slots, platesPerSet } = planDesign({ groups, replicates, plateSize, excludeEdges, disabledWells });
             const optimize = balancePositions || rotatePositions;
@@ -313,7 +315,7 @@
                     const positions = shuffle(slots, rng);
                     const wells = {};
                     groupIndexes.forEach((g, k) => {
-                        wells[positions[k]] = { color: GROUP_COLORS[g % GROUP_COLORS.length], label: groups[g] };
+                        wells[positions[k]] = { color: groupColorFor(groups, g, groupColors), label: groups[g] };
                     });
                     return { name: plateName(i), wells };
                 });
@@ -365,6 +367,21 @@
             return [...entries.values()].sort((a, b) => colorOrder(a.color) - colorOrder(b.color));
         };
 
+        // Groups offered in the toolbar: design groups first (in input order), then any other
+        // labels already on the plates. Colour: the user's choice, else the plates, else the generator's default
+        const buildGroupOptions = (designGroups, legend, groupColors = {}) => {
+            const plateColor = new Map();
+            legend.forEach((entry) => {
+                if (entry.label && entry.color !== BLANK && !plateColor.has(entry.label)) plateColor.set(entry.label, entry.color);
+            });
+            const labels = [...new Set([...designGroups, ...plateColor.keys()])];
+            return labels.map((label) => {
+                const index = designGroups.indexOf(label);
+                const defaultColor = index >= 0 ? GROUP_COLORS[index % GROUP_COLORS.length] : undefined;
+                return { label, color: groupColors[label] || plateColor.get(label) || defaultColor };
+            });
+        };
+
         const csvField = (value) => `"${String(value).replace(/"/g, '""')}"`;
         const unquote = (value = '') => value.trim().replace(/^"|"$/g, '').replace(/""/g, '"');
         const splitCsvLine = (line) => line.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map(unquote);
@@ -380,6 +397,7 @@
             disabledWells: {},
             balancePositions: true,
             rotatePositions: true,
+            groupColors: {},
             seed: randomSeed(),
         };
 
@@ -607,6 +625,7 @@
                             usableWells: slots.length,
                             balancePositions: design.balancePositions,
                             rotatePositions: design.rotatePositions,
+                            groupColors: design.groupColors,
                             seed: design.seed,
                         })}
                         disabled={!canGenerate || isGenerating}
@@ -688,11 +707,88 @@
         };
 
         // Sticky above the plates so colour and labels stay in reach while scrolling
-        const PaintToolbar = ({ selectedColor, onSelectColor, groupLabel, onGroupLabelChange, onApplyGroupLabel, activeTitle, activeData, onActiveLabelChange }) => {
+        const PaintToolbar = ({ selectedColor, onSelectColor, groupOptions, brushLabel, onSelectGroup, onSetGroupColor, groupLabel, onGroupLabelChange, onApplyGroupLabel, activeTitle, activeData, onActiveLabelChange }) => {
             const colorName = WELL_COLORS.find((c) => c.value === selectedColor)?.name;
+            const [colorMenuFor, setColorMenuFor] = useState(null);
+
+            useEffect(() => {
+                if (colorMenuFor === null) return undefined;
+                const closeOnOutside = (e) => {
+                    if (!e.target.closest('[data-color-popover]')) setColorMenuFor(null);
+                };
+                const closeOnEscape = (e) => {
+                    if (e.key === 'Escape') setColorMenuFor(null);
+                };
+                document.addEventListener('pointerdown', closeOnOutside);
+                document.addEventListener('keydown', closeOnEscape);
+                return () => {
+                    document.removeEventListener('pointerdown', closeOnOutside);
+                    document.removeEventListener('keydown', closeOnEscape);
+                };
+            }, [colorMenuFor]);
             const compactInput = 'flex-1 min-w-0 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50';
             return (
                 <div className="sticky top-2 z-30 mb-4 bg-white/95 backdrop-blur border border-slate-200 rounded-2xl shadow-sm px-4 py-3 flex flex-wrap items-center gap-x-6 gap-y-3">
+                    <datalist id="group-label-options">
+                        {groupOptions.map((option) => <option key={option.label} value={option.label} />)}
+                    </datalist>
+                    {groupOptions.length > 0 && (
+                        <div className="w-full flex flex-wrap items-center gap-1.5">
+                            <span className="text-[11px] font-black text-slate-400 uppercase tracking-widest mr-1">Groups</span>
+                            {groupOptions.map((option) => (
+                                <div
+                                    key={option.label}
+                                    data-color-popover
+                                    className={`relative flex items-center rounded-full text-xs font-bold border transition-all ${
+                                        brushLabel === option.label
+                                            ? 'border-indigo-600 bg-indigo-50 text-indigo-700 ring-1 ring-indigo-600'
+                                            : 'border-slate-200 bg-white text-slate-600 hover:border-indigo-400'
+                                    }`}
+                                >
+                                    <button
+                                        onClick={() => setColorMenuFor(colorMenuFor === option.label ? null : option.label)}
+                                        title="この群の色を変更"
+                                        className="flex items-center gap-0.5 pl-2 pr-1 py-1 rounded-l-full hover:bg-slate-100"
+                                    >
+                                        <span className="w-3.5 h-3.5 rounded-full border border-slate-200" style={{ backgroundColor: option.color || BLANK }}></span>
+                                        <span className="text-[9px] text-slate-400">▾</span>
+                                    </button>
+                                    <button
+                                        onClick={() => onSelectGroup(option)}
+                                        title="この群の色とラベルで塗る"
+                                        className="pl-1 pr-2.5 py-1 rounded-r-full"
+                                    >
+                                        {option.label}
+                                    </button>
+                                    {colorMenuFor === option.label && (
+                                        <div className="absolute top-full left-0 mt-1 z-40 bg-white border border-slate-200 rounded-xl shadow-lg p-2 flex gap-1">
+                                            {GROUP_COLORS.map((color) => {
+                                                const usedBy = groupOptions.filter((o) => o.color === color && o.label !== option.label).map((o) => o.label);
+                                                return (
+                                                    <button
+                                                        key={color}
+                                                        onClick={() => { onSetGroupColor(option.label, color); setColorMenuFor(null); }}
+                                                        title={`${WELL_COLORS.find((c) => c.value === color)?.name}${usedBy.length > 0 ? `（${usedBy.join('、')} が使用中）` : ''}`}
+                                                        className={`relative w-6 h-6 rounded-full border-2 transition-all hover:scale-110 ${
+                                                            option.color === color ? 'ring-2 ring-offset-1 ring-indigo-600 border-white' : 'border-white'
+                                                        }`}
+                                                        style={{ backgroundColor: color }}
+                                                    >
+                                                        {usedBy.length > 0 && (
+                                                            <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-white border border-slate-400"></span>
+                                                        )}
+                                                    </button>
+                                                );
+                                            })}
+                                        </div>
+                                    )}
+                                </div>
+                            ))}
+                            {brushLabel !== null && (
+                                <span className="text-[11px] font-bold text-indigo-600 ml-1">塗ると「{brushLabel}」のラベルも付きます</span>
+                            )}
+                        </div>
+                    )}
                     <div className="flex flex-wrap items-center gap-1.5">
                         {WELL_COLORS.map((color) => (
                             <button
@@ -700,7 +796,7 @@
                                 onClick={() => onSelectColor(color.value)}
                                 title={color.name}
                                 className={`w-7 h-7 rounded-full border-2 transition-all hover:scale-110 ${
-                                    selectedColor === color.value ? 'ring-2 ring-offset-2 ring-indigo-600 border-white' : 'border-slate-200'
+                                    selectedColor === color.value && brushLabel === null ? 'ring-2 ring-offset-2 ring-indigo-600 border-white' : 'border-slate-200'
                                 }`}
                                 style={{ backgroundColor: color.value }}
                             />
@@ -713,6 +809,7 @@
                             value={groupLabel}
                             onChange={(e) => onGroupLabelChange(e.target.value)}
                             onKeyDown={(e) => { if (e.key === 'Enter') onApplyGroupLabel(); }}
+                            list="group-label-options"
                             placeholder={selectedColor === BLANK ? '色を選ぶと一括ラベルを付けられます' : `${colorName} のウェルに一括ラベル`}
                             disabled={selectedColor === BLANK}
                             className={compactInput}
@@ -734,6 +831,7 @@
                             type="text"
                             value={activeData?.label || ''}
                             onChange={onActiveLabelChange}
+                            list="group-label-options"
                             disabled={!activeTitle}
                             placeholder={activeTitle ? 'このウェルのラベル' : 'ウェルをクリックするとラベルを入力できます'}
                             className={compactInput}
@@ -916,6 +1014,7 @@
             const [isGenerating, setIsGenerating] = useState(false);
             const [isDragging, setIsDragging] = useState(false);
             const [groupLabelInput, setGroupLabelInput] = useState('');
+            const [brushLabel, setBrushLabel] = useState(null);
 
             const plateRef = useRef(null);
             const fileInputRef = useRef(null);
@@ -923,6 +1022,7 @@
 
             const activeData = activeWell ? plates[activeWell.plate]?.wells[activeWell.id] : null;
             const legend = buildLegend(plates);
+            const groupOptions = buildGroupOptions(parseList(design.groupsText, /\r?\n/), legend, design.groupColors);
             const balance = analyzeBalance(plates, plateSize);
             const unusedWells = new Set(design.disabledWells[plateSize] || []);
             const savedEntry = library.find((d) => d.id === designId);
@@ -976,11 +1076,38 @@
                 setPlateSize(size);
             };
 
-            const updateWellColor = (plateIndex, id, color) => {
+            // label is only overwritten when given (group brush); otherwise the well keeps its own
+            const updateWellColor = (plateIndex, id, color, label) => {
                 updatePlateWells(plateIndex, (wells) => ({
                     ...wells,
-                    [id]: { ...wells[id], color, label: wells[id]?.label || '' }
+                    [id]: { ...wells[id], color, label: label !== undefined ? label : wells[id]?.label || '' }
                 }));
+            };
+
+            const selectColor = (color) => {
+                setSelectedColor(color);
+                // Drop the group name the brush put in the bulk-label field so it isn't applied to another colour
+                if (brushLabel !== null && groupLabelInput === brushLabel) setGroupLabelInput('');
+                setBrushLabel(null);
+            };
+
+            // Remember the group's colour and repaint its existing wells to match
+            const setGroupColor = (label, color) => {
+                setDesign((prev) => ({ ...prev, groupColors: { ...prev.groupColors, [label]: color } }));
+                setPlates((prev) => prev.map((plate) => ({
+                    ...plate,
+                    wells: Object.fromEntries(Object.entries(plate.wells).map(([id, well]) => [
+                        id,
+                        well.label === label ? { ...well, color } : well
+                    ]))
+                })));
+                if (brushLabel === label) setSelectedColor(color);
+            };
+
+            const selectGroup = (option) => {
+                setSelectedColor(option.color);
+                setBrushLabel(option.label);
+                setGroupLabelInput(option.label);
             };
 
             const handleWellPointerDown = (e, plateIndex, id) => {
@@ -990,14 +1117,16 @@
                 }
                 setIsDragging(true);
                 setActiveWell({ plate: plateIndex, id });
-                const current = plates[plateIndex].wells[id]?.color;
-                const newColor = current === selectedColor && selectedColor !== BLANK ? BLANK : selectedColor;
-                updateWellColor(plateIndex, id, newColor);
+                const current = plates[plateIndex].wells[id];
+                const matchesBrush = current?.color === selectedColor && (brushLabel === null || current?.label === brushLabel);
+                const newColor = matchesBrush && selectedColor !== BLANK ? BLANK : selectedColor;
+                const newLabel = brushLabel === null ? undefined : newColor === BLANK ? '' : brushLabel;
+                updateWellColor(plateIndex, id, newColor, newLabel);
             };
 
             const handleWellPointerEnter = (plateIndex, id) => {
                 if (isDragging) {
-                    updateWellColor(plateIndex, id, selectedColor);
+                    updateWellColor(plateIndex, id, selectedColor, brushLabel ?? undefined);
                 }
             };
 
@@ -1385,7 +1514,11 @@
                         <main className="lg:col-span-9">
                             <PaintToolbar
                                 selectedColor={selectedColor}
-                                onSelectColor={setSelectedColor}
+                                onSelectColor={selectColor}
+                                groupOptions={groupOptions}
+                                brushLabel={brushLabel}
+                                onSelectGroup={selectGroup}
+                                onSetGroupColor={setGroupColor}
                                 groupLabel={groupLabelInput}
                                 onGroupLabelChange={setGroupLabelInput}
                                 onApplyGroupLabel={applyGroupLabel}
